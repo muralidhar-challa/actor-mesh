@@ -33,10 +33,10 @@ One binary. Config and handler define behaviour.
 ```
 ┌──────────────────────────────────────────────────┐
 │                  ZMQ Proxy                       │
-│   XSUB — collects published tuples              │
-│   XPUB — fans out to subscribers               │
-│   HWM  — backpressure built in                 │
-│   PROXY_COMPRESS=zlib|zstd|none                │
+│   XSUB — collects published tuples               │
+│   XPUB — fans out to subscribers                 │
+│   HWM  — backpressure built in                   │
+│   PROXY_COMPRESS=zlib|zstd|none                  │
 └───────────────────┬──────────────────────────────┘
                     │  tcp://
           ┌─────────┼─────────┐

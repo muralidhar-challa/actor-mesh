@@ -1,30 +1,55 @@
-# Makefile — employee mesh
+# Makefile — actor mesh
 #
-# ── What this does ─────────────────────────────────────────────────────────
-#   A simple employee Q&A mesh:
-#     gateway     →  receives user questions
-#     sqlite-tool →  queries employee SQLite DB
-#     llm-agent   →  calls Ollama to answer using query results
+# ── Build ──────────────────────────────────────────────────────────────────
+#   make all              build actor + proxy
+#   make actor            build actor binary only
+#   make proxy            build proxy binary only
+#   make clean            remove binaries
 #
-# ── Quick start ────────────────────────────────────────────────────────────
-#   make build        build actor + proxy binaries
-#   make db-seed      create and seed employee SQLite DB
-#   make run          start full mesh
+# ── Run (employee mesh demo) ───────────────────────────────────────────────
+#   make run              start proxy + all actors
+#   make stop             kill all mesh processes
 #   make query Q="list all engineers"   send a test query
-#   make stop         stop all mesh processes
+#   make logs             show recent thread log
 #
-# ── Dependencies ───────────────────────────────────────────────────────────
+# ── Deps ──────────────────────────────────────────────────────────────────
 #   apt install libzmq3-dev liblmdb-dev sqlite3
-#   Ollama running locally: https://ollama.ai
-#   curl, jq — available on alpine/ubuntu
+#   Ollama running locally
+
+# ── Compiler ───────────────────────────────────────────────────────────────
+
+CC     = gcc
+CFLAGS = -Wall -Wextra -O2 -std=c11 -Iruntime
+LIBS   = -lzmq -llmdb
+
+ifdef ACTOR_MAX_PAYLOAD
+CFLAGS += -DACTOR_MAX_PAYLOAD=$(ACTOR_MAX_PAYLOAD)
+endif
+
+# ── Build targets ──────────────────────────────────────────────────────────
+
+.PHONY: all actor proxy client clean
+
+all: actor proxy client
+
+actor: runtime/main.c runtime/actor.c runtime/actor.h \
+       runtime/actor_tuple.h runtime/actor_uuid.h
+	$(CC) $(CFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o actor
+
+proxy: proxy/proxy.c
+	$(CC) $(CFLAGS) proxy/proxy.c $(LIBS) -o zmq-proxy
+
+client: client.c runtime/actor_tuple.h runtime/actor_uuid.h
+	$(CC) $(CFLAGS) client.c $(LIBS) -o client
+
+clean:
+	rm -f actor zmq-proxy client
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
-ACTOR_BIN   ?= ../actor-mesh/actor
-PROXY_BIN   ?= ../actor-mesh/zmq-proxy
-LMDB_BASE   ?= /tmp/employee-mesh/lmdb
-EMPLOYEE_DB ?= /tmp/employee-mesh/db/employees.db
-SQLITE_LOG  ?= /tmp/employee-mesh/gateway.db
+LMDB_BASE   ?= /tmp/actor-mesh
+EMPLOYEE_DB ?= $(PWD)/employee.db
+SQLITE_LOG  ?= /tmp/actor-mesh/gateway.db
 
 # ── Bus ────────────────────────────────────────────────────────────────────
 
@@ -36,7 +61,7 @@ BUS_PUB         ?= tcp://localhost:5557
 # ── Ollama ─────────────────────────────────────────────────────────────────
 
 OLLAMA_URL   ?= http://localhost:11434
-OLLAMA_MODEL ?= llama3.2
+OLLAMA_MODEL ?= gemma4:e2b
 
 # ── Common actor env ───────────────────────────────────────────────────────
 
@@ -46,35 +71,17 @@ COMMON_ENV = \
 	ACTOR_HEARTBEAT_MS=5000 \
 	ACTOR_RETRY_MAX=3
 
-# ── Targets ────────────────────────────────────────────────────────────────
+# ── Run targets ────────────────────────────────────────────────────────────
 
-.PHONY: all build db-seed run stop \
-        run-proxy run-gateway run-sqlite-tool run-llm-agent \
-        query logs clean
-
-all: build db-seed
-
-# ── Build ──────────────────────────────────────────────────────────────────
-
-build:
-	@$(MAKE) -C ../actor-mesh all
-	@echo "[build] actor and proxy ready"
-
-# ── Database ───────────────────────────────────────────────────────────────
-
-db-seed:
-	@mkdir -p $(dir $(EMPLOYEE_DB))
-	@EMPLOYEE_DB=$(EMPLOYEE_DB) sh db/seed.sh
-
-# ── Run ────────────────────────────────────────────────────────────────────
+.PHONY: run stop run-proxy run-gateway run-sqlite-tool run-llm-agent query logs
 
 run: run-proxy run-sqlite-tool run-llm-agent run-gateway
 	@echo "[mesh] employee mesh running"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
-	@pkill -f zmq-proxy || true
-	@pkill -f './actor'  || true
+	@pkill -9 -f zmq-proxy || true
+	@pkill -9 -f './actor'  || true
 	@echo "[mesh] stopped"
 
 # ── Proxy ──────────────────────────────────────────────────────────────────
@@ -83,7 +90,7 @@ run-proxy:
 	@mkdir -p $(LMDB_BASE)
 	PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
 	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
-	$(PROXY_BIN) &
+	./zmq-proxy &
 	@sleep 0.2
 	@echo "[proxy] started"
 
@@ -98,7 +105,7 @@ run-gateway:
 	ACTOR_HANDLER="sh handlers/gateway.sh" \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/gateway \
 	SQLITE_LOG=$(SQLITE_LOG) \
-	$(ACTOR_BIN) &
+	./actor &
 	@echo "[actor] gateway started"
 
 # ── SQLite Tool ────────────────────────────────────────────────────────────
@@ -112,7 +119,7 @@ run-sqlite-tool:
 	ACTOR_HANDLER="sh handlers/sqlite-tool.sh" \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR_BIN) &
+	./actor &
 	@echo "[actor] sqlite-tool started"
 
 # ── LLM Agent ─────────────────────────────────────────────────────────────
@@ -121,13 +128,14 @@ run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent
 	$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=sql_result \
+	ACTOR_TOPIC=user_message \
 	ACTOR_RESULT_TOPIC=agent_response \
 	ACTOR_HANDLER="sh handlers/llm-agent.sh" \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 	OLLAMA_URL=$(OLLAMA_URL) \
 	OLLAMA_MODEL=$(OLLAMA_MODEL) \
-	$(ACTOR_BIN) &
+	EMPLOYEE_DB=$(EMPLOYEE_DB) \
+	./actor &
 	@echo "[actor] llm-agent started"
 
 # ── Test query ─────────────────────────────────────────────────────────────
@@ -148,9 +156,3 @@ logs:
 		"SELECT datetime(emitted_at/1000000000,'unixepoch'), topic, origin \
 		 FROM thread_log ORDER BY emitted_at DESC LIMIT 20" 2>/dev/null \
 		|| echo "[logs] no thread log yet"
-
-# ── Clean ──────────────────────────────────────────────────────────────────
-
-clean:
-	@rm -rf /tmp/employee-mesh
-	@echo "[clean] done"

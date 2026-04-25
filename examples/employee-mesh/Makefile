@@ -8,7 +8,6 @@
 #
 # ── Quick start ────────────────────────────────────────────────────────────
 #   make build        build actor + proxy binaries
-#   make db-seed      create and seed employee SQLite DB
 #   make run          start full mesh
 #   make query Q="list all engineers"   send a test query
 #   make stop         stop all mesh processes
@@ -23,7 +22,7 @@
 ACTOR_BIN   ?= ../actor-mesh/actor
 PROXY_BIN   ?= ../actor-mesh/zmq-proxy
 LMDB_BASE   ?= /tmp/employee-mesh/lmdb
-EMPLOYEE_DB ?= /tmp/employee-mesh/db/employees.db
+EMPLOYEE_DB ?= $(dir $(abspath $(lastword $(MAKEFILE_LIST))))db/employees.db
 SQLITE_LOG  ?= /tmp/employee-mesh/gateway.db
 
 # ── Bus ────────────────────────────────────────────────────────────────────
@@ -48,23 +47,17 @@ COMMON_ENV = \
 
 # ── Targets ────────────────────────────────────────────────────────────────
 
-.PHONY: all build db-seed run stop \
+.PHONY: all build run stop \
         run-proxy run-gateway run-sqlite-tool run-llm-agent \
         query logs clean
 
-all: build db-seed
+all: build
 
 # ── Build ──────────────────────────────────────────────────────────────────
 
 build:
 	@$(MAKE) -C ../actor-mesh all
 	@echo "[build] actor and proxy ready"
-
-# ── Database ───────────────────────────────────────────────────────────────
-
-db-seed:
-	@mkdir -p $(dir $(EMPLOYEE_DB))
-	@EMPLOYEE_DB=$(EMPLOYEE_DB) sh db/seed.sh
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
