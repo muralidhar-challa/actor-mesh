@@ -1,0 +1,54 @@
+# Reference
+
+## Memory Model
+
+Zero heap allocation per tuple in the runtime. All buffers are file-scope BSS, sized at compile time:
+
+```c
+static uint8_t g_result_buf[ACTOR_MAX_PAYLOAD];
+static uint8_t g_frame_buf[ACTOR_MAX_PAYLOAD + sizeof(actor_header_t)];
+```
+
+| Component | Idle RSS | Detail |
+|---|---|---|
+| `zmq-proxy` | ~8 MB | ZMQ socket buffers only |
+| actor runtime | ~8 MB | ZMQ + LMDB mmap + payload BSS |
+| handler invocation | ~4 MB peak | Static BSS + shared libs; exits immediately |
+
+A payload exceeding the cap is dropped with a log message — never `malloc`. Override at build time:
+
+```bash
+make ACTOR_MAX_PAYLOAD=4194304
+```
+
+## Properties
+
+| Property | Guarantee |
+|---|---|
+| No shared state | Actors communicate exclusively through tuples. No shared memory, no shared connections, no globals across process boundaries. |
+| Language agnostic | The handler contract is stdin/stdout. A shell script is a valid handler. |
+| Fault isolation | A handler that panics or OOMs takes nothing else down. The runtime and bus are unaffected. |
+| Zero-alloc runtime | Static buffers only in the message path. Header cast from raw bytes. Payload in BSS. No heap allocation. |
+| Durable by default | Every tuple is written to LMDB before fork and before publish. A crash at any point is recoverable on restart. |
+| Observable | Every tuple is a published event. Subscribe to `heartbeat` to see the mesh. Subscribe to `*` to see everything. |
+| Composable | Adding an actor to a running mesh requires zero changes to existing actors. Subscribe to a topic, emit on a topic, done. |
+
+## Lineage
+
+This design independently converges on ideas that have proven themselves over decades:
+
+| Lineage | Connection |
+|---|---|
+| **Erlang/OTP (1986)** | Actor model, let it crash, message passing |
+| **Unix pipes (1969)** | stdio as the universal process interface |
+| **Linda tuplespace (1986)** | Decoupled coordination via shared space |
+| **Plan 9** | Everything is a file; communicate via read/write |
+
+The difference: C native, zero framework, same binary from edge to cloud.
+
+---
+
+> The runtime does not know what a message means.
+> The handler does not know where the message came from.
+> The bus does not know who is subscribed.
+> This is the design.

@@ -1,0 +1,66 @@
+# Durability
+
+## LMDB
+
+Each actor maintains a private **LMDB** environment — a memory-mapped B-tree — with three named databases:
+
+```{=html}
+<div class="env-table">
+  <div class="env-row"><div class="env-key">inbox/</div><div class="env-val">Raw frame written before fork. Cleared after publish. On restart, unprocessed tuples are redelivered.</div></div>
+  <div class="env-row"><div class="env-key">outbox/</div><div class="env-val">Result frame written before publish. Cleared after publish. On restart, unsent results are republished.</div></div>
+  <div class="env-row"><div class="env-key">state/</div><div class="env-val">Handler-managed state. Keyed by correlation ID for multi-turn conversations across separate invocations.</div></div>
+</div>
+```
+
+A crash between fork and publish leaves the tuple in `inbox/`. A crash between result write and publish leaves it in `outbox/`. Either way, the actor recovers on restart with no central coordinator.
+
+```{mermaid}
+sequenceDiagram
+  participant R as Runtime
+  participant H1 as Handler (round 1)
+  participant L as LMDB
+  participant H2 as Handler (round 2)
+
+  R  ->> L  : inbox.put(tuple_id, frame)
+  R  ->> H1 : stdin payload · CORRELATION_ID=abc
+  H1 ->> L  : state.put("abc", history)
+  H1 ->> R  : stdout result
+  R  ->> L  : outbox.put(result_id, frame)
+  R  ->> R  : publish to bus
+  R  ->> L  : inbox.del + outbox.del
+
+  Note over R: new tuple, same correlation ID
+
+  R  ->> H2 : stdin payload · CORRELATION_ID=abc
+  H2 ->> L  : state.get("abc") → history
+  H2 ->> R  : stdout final result
+```
+
+LMDB provides atomic commits — a crash mid-write leaves the previous state intact.
+
+## Heartbeat
+
+Every actor emits a heartbeat tuple on a timer:
+
+```json
+{"id": "sqlite-tool-1", "inbox": 0, "outbox": 0}
+```
+
+Topic: `heartbeat` — TTL: 3× heartbeat interval — Default interval: 5 s
+
+Any actor subscribing to `heartbeat` observes the full mesh state without instrumentation. A debug actor subscribing to `*` sees every tuple on the bus.
+
+## Retry Policy
+
+On handler non-zero exit the runtime retries with exponential backoff:
+
+```{=html}
+<div class="env-table">
+  <div class="env-row"><div class="env-key">attempt 1</div><div class="env-val">retry after 100 ms</div></div>
+  <div class="env-row"><div class="env-key">attempt 2</div><div class="env-val">retry after 200 ms</div></div>
+  <div class="env-row"><div class="env-key">attempt 3</div><div class="env-val">retry after 400 ms</div></div>
+  <div class="env-row"><div class="env-key">max retries exceeded</div><div class="env-val">drop tuple, log error</div></div>
+</div>
+```
+
+`ACTOR_RETRY_MAX` controls the ceiling (default 3). A payload exceeding `ACTOR_MAX_PAYLOAD` is dropped immediately — no retry, no malloc.

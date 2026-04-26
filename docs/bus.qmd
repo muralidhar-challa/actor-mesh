@@ -1,0 +1,51 @@
+# The Bus
+
+The mesh has one structural component: a **publish/subscribe proxy** that connects publishers to subscribers by topic. No actor knows about any other actor. There are no direct connections.
+
+```{mermaid}
+sequenceDiagram
+  participant A as actor A
+  participant B as actor B
+  participant C as client
+  participant BUS as XSUB / XPUB proxy
+  participant X as actor X
+  participant Y as actor Y
+  participant Z as actor Z
+
+  A ->> BUS : topic=orders
+  BUS ->> X : topic=orders
+  BUS ->> Z : topic=orders
+
+  B ->> BUS : topic=alerts
+  BUS ->> Y : topic=alerts
+  BUS ->> Z : topic=alerts
+
+  C ->> BUS : topic=orders
+  BUS ->> X : topic=orders
+  BUS ->> Z : topic=orders
+```
+
+A message published on topic `orders` reaches every subscriber of `orders` — including actors that don't exist yet when the sender runs.
+
+::: {.callout}
+**The proxy is not a broker.** It holds no queues, makes no routing decisions, and persists nothing. It is a wire junction. Durability, ordering, and acknowledgement are concerns of the actors themselves.
+:::
+
+## Backpressure
+
+ZMQ sockets have a built-in **high water mark** (HWM) — a hard ceiling on the number of messages queued in memory. When a slow subscriber falls behind, its queue fills to the HWM and ZMQ starts dropping messages on the publisher side rather than buffering without bound.
+
+This is not a failure mode — it is a design decision. The mesh trades delivery guarantee for bounded memory. Durability is the actor's responsibility via LMDB, not the bus's. A tuple dropped at the bus is a tuple the actor never wrote to its inbox, which means it was never processed and never committed. No partial state, no corruption.
+
+::: {.callout}
+**The proxy holds no queues of its own.** HWM applies to the per-socket buffers inside ZMQ. The proxy itself is stateless — it is a forwarding junction, not a store. A crashed proxy loses nothing; actors reconnect and continue.
+:::
+
+## Endpoints
+
+The proxy is 74 lines of C. It binds two ZMQ sockets and forwards between them:
+
+- **XSUB** on `tcp://*:5557` — actors publish here
+- **XPUB** on `tcp://*:5556` — actors subscribe here
+
+Both endpoints are configurable via `PROXY_XSUB_BIND` and `PROXY_XPUB_BIND`.

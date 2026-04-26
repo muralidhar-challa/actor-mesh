@@ -1,0 +1,83 @@
+# AI Agents
+
+An AI agent is an actor whose handler calls a language model. Nothing else changes.
+
+```{=html}
+<div class="two-col">
+  <div>
+    <div class="card"><h3>Tool calling</h3><p>Tools are actors. Calling a tool means publishing to its topic. The result arrives as a new message on a subscribed topic.</p></div>
+    <div class="card"><h3>Multi-round state</h3><p>Conversation history lives in LMDB <code>state/</code>, keyed by correlation ID. Each round picks up exactly where the last left off.</p></div>
+  </div>
+  <div>
+    <div class="card"><h3>Agent chaining</h3><p>An agent publishes to another agent's topic. Supervisor, specialist, critic — all natural compositions on the same bus.</p></div>
+    <div class="card"><h3>Fault isolation</h3><p>A crashing handler exits. The runtime survives. The next tuple spawns a fresh process. No shared heap, no corrupted state.</p></div>
+  </div>
+</div>
+```
+
+## The ReAct Loop
+
+ReAct — Reason + Act — is the standard agentic pattern: reason about what to do, call a tool, observe the result, iterate until done. On a mesh this loop is a **message flow**, not a control flow.
+
+```{mermaid}
+sequenceDiagram
+  autonumber
+  participant C  as Client
+  participant AG as Agent actor
+  participant TL as Tool actor
+
+  C  ->> AG : user_message {query, session_id}
+  Note over AG: build prompt, call LLM with tools
+  AG ->> TL : sql_query {sql}
+  Note over TL: execute SQL, return rows
+  TL ->> AG : sql_result {rows}
+  Note over AG: load state from LMDB, append tool result, call LLM again
+  AG ->> C  : agent_response {answer}
+```
+
+The agent actor subscribes to both `user_message` and `sql_result`. The bus does not care that the same actor receives both. The correlation ID ties two separate invocations into one logical conversation.
+
+::: {.callout}
+**The loop has no fixed depth.** An agent can emit `sql_query`, receive `sql_result`, emit another `sql_query`, and so on up to whatever bound the handler enforces. The runtime is oblivious — it just delivers tuples.
+:::
+
+## Multi-Agent Topology
+
+```{mermaid}
+stateDiagram-v2
+  direction TB
+
+  User        : user
+  Supervisor  : supervisor agent
+  DataAgent   : data agent
+  CodeAgent   : code agent
+  WebAgent    : web agent
+  SQLTool     : sql tool
+  PyRunner    : python runner
+  WebFetch    : web fetch
+
+  [*]         --> User
+  User        --> Supervisor  : request
+
+  Supervisor  --> DataAgent   : data_query
+  Supervisor  --> CodeAgent   : code_task
+  Supervisor  --> WebAgent    : web_task
+
+  DataAgent   --> SQLTool     : sql_query
+  SQLTool     --> DataAgent   : sql_result
+
+  CodeAgent   --> PyRunner    : run_python
+  PyRunner    --> CodeAgent   : run_result
+
+  WebAgent    --> WebFetch    : fetch_url
+  WebFetch    --> WebAgent    : fetch_result
+
+  DataAgent   --> Supervisor  : data_result
+  CodeAgent   --> Supervisor  : code_result
+  WebAgent    --> Supervisor  : web_result
+
+  Supervisor  --> User        : response
+  User        --> [*]
+```
+
+Each box is an independent process. The supervisor has no imports from specialist code. Every edge is a topic on the bus.

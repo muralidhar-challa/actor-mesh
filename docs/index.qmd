@@ -1,0 +1,45 @@
+# Preface {.unnumbered}
+
+An actor mesh is three ideas held together tightly: a **message bus** that nobody owns, **actors** that share nothing, and **handlers** that are just processes. Everything else — AI agents, tool-calling loops, stateful conversations — falls out of those three ideas without modification.
+
+```{=html}
+<div class="stat-row">
+  <div class="stat"><div class="stat-num">430</div><div class="stat-lbl">LOC — runtime</div></div>
+  <div class="stat"><div class="stat-num">74</div><div class="stat-lbl">LOC — proxy</div></div>
+  <div class="stat"><div class="stat-num">256 B</div><div class="stat-lbl">Fixed header</div></div>
+  <div class="stat"><div class="stat-num">1 MB</div><div class="stat-lbl">Max payload</div></div>
+  <div class="stat"><div class="stat-num">0</div><div class="stat-lbl">Heap allocs in runtime</div></div>
+</div>
+```
+
+The runtime is ~430 lines of C. The proxy is 74 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
+
+```
+SQL Tool   →  actor + handlers/sqlite-tool   subscribes to: sql_query
+LLM Agent  →  actor + handlers/llm-agent     subscribes to: user_message, sql_result
+Observer   →  actor + <any handler>          subscribes to: heartbeat
+```
+
+One binary. Config and handler define behaviour.
+
+---
+
+## What it is
+
+A publish/subscribe bus that nobody owns. Actors that share nothing. Handlers that are OS processes. That is the complete list of concepts. Everything else is composition.
+
+The runtime does not know what a message means. The handler does not know where the message came from. The bus does not know who is subscribed. This ignorance is load-bearing — it is what makes the system composable without coordination.
+
+A shell script that reads from `stdin` and writes to `stdout` is a fully valid, production-grade compute unit on this mesh. That sentence is not a simplification. It is the spec.
+
+## What it is not
+
+**Not a workflow engine.** Temporal, Airflow, Prefect, Dagster — all of them have a process that knows the shape of the work. A coordinator, a scheduler, a flow definition, a DAG. That process is a single point of failure, a scaling bottleneck, and a thing you have to operate. This mesh has no such process. The topology is not defined anywhere. It emerges from what actors subscribe to.
+
+**Not an orchestrator.** An orchestrator directs. It holds state about what step comes next, retries on your behalf through a central lens, and fails when the orchestrator fails. Here, every actor is autonomous. Retry policy lives in the runtime, durability lives in LMDB, and no actor knows any other actor exists.
+
+**Not a framework.** There is no SDK to import. No base class to extend. No decorator to apply. The only interface is `stdin` and `stdout` — a contract that has been stable since 1969. You do not write actors in the actor mesh style. You write processes, and the mesh runs them.
+
+**Not a message queue.** Kafka, RabbitMQ, SQS — queues hold messages, guarantee ordering, track consumer offsets, and require brokers with their own operational surface. The proxy here is 74 lines of C. It holds nothing. It is a wire junction, not a store.
+
+**Not comparable to any of the above.** Those tools solve the problem of coordinating work across processes by adding a layer that understands the work. This solves the same problem by refusing to add that layer. Comparing them is a category error — the designs disagree at the axiom level, not at the feature level.

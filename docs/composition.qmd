@@ -1,0 +1,19 @@
+# Composing Actors
+
+Actors compose by publishing to each other's topics. No orchestrator, no service registry, no shared code.
+
+```{mermaid}
+stateDiagram-v2
+  direction LR
+  [*]       --> Validator : request
+  Validator --> Pricer    : valid_order
+  Pricer    --> Risk      : priced_order
+  Risk      --> Executor  : approved_order
+  Executor  --> [*]       : execution record
+```
+
+To insert a compliance check between risk and execution: add one actor, subscribe to `approved_order`, emit `cleared_order`. Existing actors are untouched.
+
+::: {.callout}
+**Every actor is identical at the runtime level.** `SQL Tool`, `LLM Agent`, `Compliance Check` — all are the same binary, distinguished only by `ACTOR_TOPIC`, `ACTOR_RESULT_TOPIC`, and `ACTOR_HANDLER`. Adding a step to a pipeline is adding a process to a system.
+:::

@@ -1,0 +1,34 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Actor Mesh"
+  subtitle: "A minimal substrate for distributed computation — and AI agents that compose."
+  author: "Muralidhar Reddy Challa"
+  date: "2026-04-26"
+  chapters:
+    - index.qmd
+    - quickstart.qmd
+    - bus.qmd
+    - actor.qmd
+    - wire.qmd
+    - handlers.qmd
+    - durability.qmd
+    - composition.qmd
+    - agents.qmd
+    - reference.qmd
+
+format:
+  html:
+    theme: [flatly, styles.scss]
+    toc: true
+    toc-depth: 3
+    toc-title: "On this page"
+    smooth-scroll: true
+    number-sections: false
+    mermaid:
+      theme: neutral
+
+execute:
+  echo: false

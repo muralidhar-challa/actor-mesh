@@ -5,3 +5,4 @@ examples/employee-mesh/client
 examples/employee-mesh/handlers/llm-agent
 examples/employee-mesh/handlers/sqlite-tool
 /tmp/
+docs/_book/*

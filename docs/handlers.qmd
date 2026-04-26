@@ -1,0 +1,79 @@
+# Handlers
+
+A handler is **any process** that reads from stdin and writes to stdout. The runtime forks a fresh process for every tuple. No persistent state in the handler. No memory leaks. No OOM.
+
+```
+read payload bytes from stdin
+do work
+write result bytes to stdout
+exit
+```
+
+## Examples
+
+A shell script is a fully valid handler:
+
+```sh
+#!/bin/sh
+payload=$(cat)
+curl -s https://api.example.com/v1/query \
+  -H "Authorization: Bearer $API_KEY" \
+  -d "$payload" \
+  | jq -c '{answer:.result}'
+```
+
+A zero-alloc C handler:
+
+```c
+static char g_in[256 * 1024];
+static char g_out[256 * 1024];
+
+int main(void) {
+    size_t n = fread(g_in, 1, sizeof(g_in) - 1, stdin);
+    g_in[n] = '\0';
+    // ... process ...
+    fputs(g_out, stdout);
+}
+```
+
+```{=html}
+<div class="three-col">
+  <div class="card"><h3>Shell script</h3><p>Zero deps. Read with <code>cat</code>, emit with <code>echo</code>. Prototype in minutes, no compilation step.</p></div>
+  <div class="card"><h3>C binary</h3><p>Static buffers, zero heap, ~100 KB text, sub-millisecond startup.</p></div>
+  <div class="card"><h3>Python / WASM</h3><p>Full standard library for rapid iteration. Sandboxed determinism with WASM.</p></div>
+</div>
+```
+
+## Header env vars
+
+The runtime sets these environment variables before forking every handler:
+
+```{=html}
+<div class="env-table">
+  <div class="env-row"><div class="env-key">ACTOR_TUPLE_ID</div><div class="env-val">Hex ID of the incoming tuple.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_CORRELATION_ID</div><div class="env-val">Hex correlation ID — stable across the entire causal chain.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_CAUSATION_ID</div><div class="env-val">Hex ID of the direct parent tuple.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_TUPLE_ORIGIN</div><div class="env-val">Actor ID that emitted the incoming tuple.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_ATTEMPT</div><div class="env-val">Retry count. 0 on first delivery.</div></div>
+</div>
+```
+
+A shell handler reads them as ordinary environment variables:
+
+```sh
+#!/bin/sh
+echo "handling tuple $ACTOR_TUPLE_ID attempt $ACTOR_ATTEMPT" >&2
+payload=$(cat)
+# ...
+```
+
+## Dynamic result routing
+
+By default the runtime publishes handler output on `ACTOR_RESULT_TOPIC`. A handler overrides this by writing a topic name as the first line of stdout:
+
+```
+sql_query
+{"type":"sql_query","sql":"SELECT ..."}
+```
+
+The runtime strips the first line and publishes the payload on that topic. One handler can fan out to multiple downstream actors without any runtime change.
