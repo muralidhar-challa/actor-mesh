@@ -1,0 +1,507 @@
+---
+title: "Actor Mesh"
+subtitle: "A minimal substrate for distributed computation — and AI agents that compose."
+author: "murali"
+date: today
+format:
+  html:
+    theme: [custom.scss]
+    toc: true
+    toc-title: "Contents"
+    toc-depth: 3
+    toc-location: left
+    number-sections: false
+    smooth-scroll: true
+    embed-resources: true
+    page-layout: article
+    mermaid:
+      theme: base
+execute:
+  echo: false
+---
+
+::: {.lead}
+An actor mesh is three ideas held together tightly: a **message bus** that nobody owns, **actors** that share nothing, and **handlers** that are just processes. That is the entire design. Everything else — AI agents, tool-calling loops, stateful conversations — falls out of those three ideas without modification.
+:::
+
+---
+
+## The Bus
+
+The mesh has one structural component: a **publish/subscribe proxy** that connects publishers to subscribers by topic.
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'clusterBkg': '#161B22', 'titleColor': '#CDD9E5',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono'
+}}}%%
+flowchart LR
+  subgraph producers["  Publishers  "]
+    direction TB
+    A1("actor A"):::box
+    A2("actor B"):::box
+    C("client"):::box
+  end
+
+  subgraph BUS["  XPUB / XSUB Proxy  "]
+    direction TB
+    XSUB("XSUB\nreceives all"):::proxy
+    XPUB("XPUB\nfan-out by topic"):::proxy
+    XSUB --> XPUB
+  end
+
+  subgraph consumers["  Subscribers  "]
+    direction TB
+    B1("actor X\ntopic: orders"):::box
+    B2("actor Y\ntopic: alerts"):::box
+    B3("actor Z\ntopic: orders, alerts"):::box
+  end
+
+  producers --> XSUB
+  XPUB --> consumers
+
+  classDef box   fill:#1C2128,stroke:#CC0000,color:#CDD9E5,rx:4
+  classDef proxy fill:#161B22,stroke:#E8861A,color:#E8861A,rx:4
+```
+
+No actor knows about any other actor. There are no direct connections. A message published on topic `orders` reaches every subscriber of `orders` — including actors that don't exist yet when the sender runs.
+
+::: {.callout-note}
+**The proxy is not a broker.** It holds no queues, makes no routing decisions, and persists nothing. It is a wire junction. Durability, ordering, and acknowledgement are all concerns of the actors themselves.
+:::
+
+---
+
+## The Actor
+
+An actor is a **long-running process** described entirely by environment variables.
+
+<div class="env-table">
+  <div class="env-row">
+    <div class="env-key">ACTOR_ID</div>
+    <div class="env-val">Unique identity of this actor instance.</div>
+  </div>
+  <div class="env-row">
+    <div class="env-key">ACTOR_TOPIC</div>
+    <div class="env-val">Comma-separated list of topics to subscribe to.</div>
+  </div>
+  <div class="env-row">
+    <div class="env-key">ACTOR_HANDLER</div>
+    <div class="env-val">Path to the handler executable invoked per message.</div>
+  </div>
+  <div class="env-row">
+    <div class="env-key">ACTOR_RESULT_TOPIC</div>
+    <div class="env-val">Default topic for handler output. Can be overridden per-message.</div>
+  </div>
+  <div class="env-row">
+    <div class="env-key">ACTOR_LMDB_PATH</div>
+    <div class="env-val">Path to this actor's private LMDB environment.</div>
+  </div>
+  <div class="env-row">
+    <div class="env-key">ACTOR_CORRELATION_ID</div>
+    <div class="env-val">Set per invocation. Identifies the causal chain this message belongs to.</div>
+  </div>
+</div>
+
+The runtime loop is eight lines of logic:
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono'
+}}}%%
+flowchart TD
+  SUB("subscribe\nto ACTOR_TOPIC"):::step
+  RECV("recv message\nheader + payload"):::step
+  FORK("fork + exec\nACTOR_HANDLER"):::step
+  STDIN("write payload\nto handler stdin"):::step
+  WAIT("wait for\nhandler exit"):::step
+  PARSE("read result\nfrom stdout"):::step
+  PUB("publish result\nto bus"):::step
+
+  SUB --> RECV --> FORK --> STDIN --> WAIT --> PARSE --> PUB --> RECV
+
+  classDef step fill:#1C2128,stroke:#CC0000,color:#CDD9E5,rx:4
+```
+
+The runtime is generic and permanent. The handler is specific and ephemeral. **Neither knows the other exists** beyond a file path and two file descriptors.
+
+---
+
+## The Wire
+
+Every message on the bus is two ZMQ frames.
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono'
+}}}%%
+packet-beta
+  0-7: "topic[32]"
+  8-39: "id[32]"
+  40-71: "correlation_id[32]"
+  72-103: "source[32]"
+  104-135: "dest[32]"
+  136-139: "payload_len (u32)"
+  140-255: "reserved"
+```
+
+| Field | Width | Notes |
+|---|---|---|
+| `topic` | 32 B | ZMQ subscription filter key — first bytes of frame 1 |
+| `id` | 32 B | UUID of this specific message |
+| `correlation_id` | 32 B | Stable across a causal chain (e.g. one user request) |
+| `source` | 32 B | Emitting actor ID |
+| `dest` | 32 B | Optional explicit destination |
+| `payload_len` | 4 B | Byte count of frame 2 |
+| reserved | 116 B | Aligned to 256 bytes total |
+
+Frame 2 is **opaque bytes** up to 1 MB. The runtime never inspects it. Handlers negotiate their own encoding — MessagePack, Protobuf, raw text — without any runtime change.
+
+::: {.callout-tip}
+**Why a fixed-size header?** The runtime can `memcpy` the header into a stack variable with no allocation, no parsing, and no branching. The payload is already in a 1 MB static buffer before `fork`. The handler never does `malloc` at all.
+:::
+
+---
+
+## The Handler Contract
+
+A handler is any executable that speaks **stdin → stdout**.
+
+```c
+// Entire contract:
+// - read payload bytes from stdin
+// - write result bytes to stdout
+// - exit
+
+int main(void) {
+    size_t n = fread(g_in, 1, sizeof(g_in) - 1, stdin);
+    // ... process ...
+    fwrite(g_out, 1, result_len, stdout);
+    return 0;
+}
+```
+
+This is deliberately the most boring interface possible. A handler can be:
+
+<div class="card-grid">
+  <div class="card">
+    <div class="card-title">C binary</div>
+    <div class="card-body">Static buffers, zero heap, ~100 KB text, sub-millisecond startup.</div>
+  </div>
+  <div class="card card-amber">
+    <div class="card-title">Python script</div>
+    <div class="card-body">Full standard library, rapid iteration, 80 ms startup amortised.</div>
+  </div>
+  <div class="card card-blue">
+    <div class="card-title">Shell script</div>
+    <div class="card-body">Pipes, coreutils, jq. Prototype in minutes.</div>
+  </div>
+  <div class="card card-green">
+    <div class="card-title">WASM module</div>
+    <div class="card-body">Sandboxed runtime, deterministic, portable binary.</div>
+  </div>
+</div>
+
+### Dynamic result routing
+
+A handler can override the result topic by writing a topic line before the payload:
+
+```
+sql_query\n<payload bytes>
+```
+
+The runtime strips the first line and publishes the payload on that topic instead of `ACTOR_RESULT_TOPIC`. This is how a single actor can branch to multiple downstream actors without any runtime change.
+
+---
+
+## State Without Sharing
+
+Actors share no memory. Each actor owns a private **LMDB** environment — a memory-mapped B-tree that survives restarts.
+
+The key is `ACTOR_CORRELATION_ID`: a 32-byte identifier set by the runtime before each handler invocation. All messages in a causal chain — a user request and all tool calls it triggers — share the same correlation ID.
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono',
+  'activationBorderColor': '#CC0000', 'signalColor': '#E8861A',
+  'labelBoxBorderColor': '#30363D', 'labelBoxBkgColor': '#161B22',
+  'actorBorder': '#30363D', 'actorBkg': '#1C2128',
+  'actorTextColor': '#CDD9E5', 'noteBorderColor': '#E8861A',
+  'noteBkgColor': '#161B22', 'noteTextColor': '#CDD9E5'
+}}}%%
+sequenceDiagram
+  participant R as Runtime
+  participant H as Handler (invocation 1)
+  participant L as LMDB
+  participant H2 as Handler (invocation 2)
+
+  R->>H: stdin payload<br/>ACTOR_CORRELATION_ID=abc123
+  H->>L: put("abc123", state)
+  H->>R: stdout result
+  Note over R: time passes, new message arrives
+
+  R->>H2: stdin payload<br/>ACTOR_CORRELATION_ID=abc123
+  H2->>L: get("abc123") → state
+  Note over H2: continues where invocation 1 left off
+  H2->>L: del("abc123")
+  H2->>R: stdout final result
+```
+
+Each handler invocation is stateless by default. State is **opt-in**: write to LMDB on the way out, read on the way back in. When the work is done, delete the key. LMDB provides atomic commits — a crash mid-write leaves the previous state intact.
+
+---
+
+## Composing Actors
+
+Actors compose by publishing to each other's topics. No orchestrator, no service registry, no coordinator.
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'clusterBkg': '#161B22', 'edgeLabelBackground': '#1C2128',
+  'fontFamily': 'JetBrains Mono'
+}}}%%
+flowchart LR
+  IN(["request"]):::src
+
+  subgraph mesh["  Mesh  "]
+    direction LR
+    V("validator\ntopic: raw_order"):::actor
+    P("pricer\ntopic: valid_order"):::actor
+    R("risk\ntopic: priced_order"):::actor
+    E("executor\ntopic: approved_order"):::actor
+
+    V -->|"valid_order"| P
+    P -->|"priced_order"| R
+    R -->|"approved_order"| E
+  end
+
+  IN --> V
+  E --> OUT(["execution\nrecord"]):::src
+
+  classDef actor fill:#1C2128,stroke:#CC0000,color:#CDD9E5,rx:4
+  classDef src   fill:#0D1117,stroke:#E8861A,color:#E8861A,rx:20
+```
+
+To insert a new step — say a compliance check between risk and execution — you add one actor subscribing to `approved_order` and emitting `cleared_order`. The risk actor and executor are untouched.
+
+---
+
+## AI Agents
+
+An AI agent is an actor whose handler calls a language model. Nothing else changes.
+
+The mesh provides exactly what agents need:
+
+<div class="card-grid">
+  <div class="card">
+    <div class="card-title">Tool calling</div>
+    <div class="card-body">Tools are actors. Calling a tool means publishing to its topic. The result arrives as a new message on a subscribed topic.</div>
+  </div>
+  <div class="card card-amber">
+    <div class="card-title">Multi-round state</div>
+    <div class="card-body">Conversation history lives in LMDB, keyed by correlation ID. Each round picks up exactly where the last left off.</div>
+  </div>
+  <div class="card card-blue">
+    <div class="card-title">Agent chaining</div>
+    <div class="card-body">An agent can publish to another agent's topic. Sub-agents, critic-agent, verifier — all natural compositions.</div>
+  </div>
+  <div class="card card-green">
+    <div class="card-title">Fault isolation</div>
+    <div class="card-body">A crashing handler exits. The runtime survives. The next message spawns a fresh process. No shared heap, no corrupted state.</div>
+  </div>
+</div>
+
+### The ReAct Loop
+
+ReAct — Reason + Act — is the standard agentic pattern: the model reasons about what to do, calls a tool, observes the result, and iterates until it can answer.
+
+On a mesh this loop is **a message flow**, not a control flow:
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono',
+  'activationBorderColor': '#CC0000', 'signalColor': '#768390',
+  'labelBoxBorderColor': '#30363D', 'labelBoxBkgColor': '#161B22',
+  'actorBorder': '#30363D', 'actorBkg': '#1C2128',
+  'actorTextColor': '#CDD9E5', 'noteBorderColor': '#E8861A',
+  'noteBkgColor': '#161B22', 'noteTextColor': '#CDD9E5',
+  'sequenceNumberColor': '#CC0000'
+}}}%%
+sequenceDiagram
+  autonumber
+  participant C  as Client
+  participant B  as Bus
+  participant AG as Agent actor
+  participant TL as Tool actor
+
+  C  ->> B  : user_message {query, session_id}
+  B  ->> AG : user_message
+  Note over AG: load system prompt<br/>call LLM with tools
+  AG ->> B  : sql_query {sql}
+  B  ->> TL : sql_query
+  Note over TL: execute SQL<br/>return rows
+  TL ->> B  : sql_result {rows}
+  B  ->> AG : sql_result
+  Note over AG: load state from LMDB<br/>append tool result<br/>call LLM again
+  AG ->> B  : agent_response {answer}
+  B  ->> C  : agent_response
+```
+
+The agent actor subscribes to **both** `user_message` and `sql_result`. It handles each identically: decode the payload, check the type, branch. The bus does not care that the same actor receives both. The correlation ID is what ties the two invocations into one logical conversation.
+
+::: {.callout-tip}
+**The loop has no fixed depth.** An agent can emit a `sql_query`, receive `sql_result`, emit another `sql_query`, and so on — up to whatever bound the handler enforces. The runtime is oblivious. It just delivers messages.
+:::
+
+### Multi-agent topology
+
+Agents compose the same way any actors do. A supervisor can delegate to specialists; specialists can call their own tools.
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'clusterBkg': '#161B22', 'edgeLabelBackground': '#1C2128',
+  'fontFamily': 'JetBrains Mono'
+}}}%%
+flowchart TB
+  U(["user"]):::src
+  S("supervisor\nagent"):::agent
+
+  subgraph specialists["  Specialist agents  "]
+    direction LR
+    DA("data\nagent"):::agent
+    CA("code\nagent"):::agent
+    WA("web\nagent"):::agent
+  end
+
+  subgraph tools["  Tools  "]
+    direction LR
+    DB("sql\ntool"):::tool
+    PY("python\nrunner"):::tool
+    WB("web\nfetch"):::tool
+  end
+
+  U  --> S
+  S  -->|"data_query"| DA
+  S  -->|"code_task"|  CA
+  S  -->|"web_task"|   WA
+
+  DA -->|"sql_query"|  DB
+  CA -->|"run_python"| PY
+  WA -->|"fetch_url"|  WB
+
+  DB -->|"sql_result"|    DA
+  PY -->|"run_result"|    CA
+  WB -->|"fetch_result"|  WA
+
+  DA -->|"data_result"| S
+  CA -->|"code_result"| S
+  WA -->|"web_result"|  S
+  S  --> U
+
+  classDef agent fill:#1C2128,stroke:#CC0000,color:#CDD9E5,rx:4
+  classDef tool  fill:#161B22,stroke:#E8861A,color:#E8861A,rx:4
+  classDef src   fill:#0D1117,stroke:#4493F8,color:#4493F8,rx:20
+```
+
+Each box is an independent process. The supervisor has no imports from specialist code. Specialists have no imports from tool code. Every edge is a topic on the bus.
+
+---
+
+## Properties
+
+<div class="card-grid">
+  <div class="card">
+    <div class="card-title">No shared state</div>
+    <div class="card-body">Actors communicate exclusively through messages. No shared memory, no shared database connections, no global variables across process boundaries.</div>
+  </div>
+  <div class="card card-amber">
+    <div class="card-title">Language agnostic</div>
+    <div class="card-body">The handler contract is stdin/stdout. Any language that can read from stdin and write to stdout is a valid handler.</div>
+  </div>
+  <div class="card card-blue">
+    <div class="card-title">Fault isolation</div>
+    <div class="card-body">A handler that panics, OOMs, or hangs takes nothing else down. The runtime process and the bus are unaffected.</div>
+  </div>
+  <div class="card card-green">
+    <div class="card-title">Zero-alloc runtime</div>
+    <div class="card-body">The runtime uses static buffers only. The 256-byte header lives on the stack. The 1 MB payload buffer is file-scope BSS. No heap allocation in the message path.</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Observable</div>
+    <div class="card-body">Every message on the bus is a published event. A debug subscriber on `*` sees everything. No instrumentation needed in handlers.</div>
+  </div>
+  <div class="card card-amber">
+    <div class="card-title">Composable</div>
+    <div class="card-body">Adding a new actor to a running mesh requires zero changes to existing actors. Subscribe to a topic, emit on a topic, done.</div>
+  </div>
+</div>
+
+---
+
+## Memory model
+
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1C2128', 'primaryTextColor': '#CDD9E5',
+  'primaryBorderColor': '#30363D', 'lineColor': '#768390',
+  'secondaryColor': '#161B22', 'tertiaryColor': '#0D1117',
+  'edgeLabelBackground': '#1C2128', 'fontFamily': 'JetBrains Mono'
+}}}%%
+flowchart LR
+  subgraph runtime_proc["  Actor runtime (persistent process)  "]
+    direction TB
+    HDR("header\n256 B stack"):::mem
+    BUF("payload buffer\n1 MB BSS"):::mem
+    ZMQ("ZMQ socket\nbuffers ~8 MB"):::mem
+    LDB("LMDB mmap\n64 MB virtual"):::mem
+  end
+
+  subgraph handler_proc["  Handler (ephemeral process)  "]
+    direction TB
+    IN("g_in\nstdin buffer"):::mem2
+    OUT("g_out\nstdout buffer"):::mem2
+    ST("static state\nBSS — no heap"):::mem2
+  end
+
+  BUF -->|"fork + pipe"| IN
+  OUT -->|"read"| BUF
+
+  classDef mem  fill:#1C2128,stroke:#CC0000,color:#CDD9E5,rx:4
+  classDef mem2 fill:#161B22,stroke:#E8861A,color:#E8861A,rx:4
+```
+
+| Component | Idle RSS | Notes |
+|---|---|---|
+| `zmq-proxy` | ~8 MB | ZMQ socket buffers, no user code |
+| actor runtime | ~8 MB | ZMQ + LMDB mmap window, 1 MB payload buf |
+| handler invocation | ~4 MB peak | Static BSS + shared libs, exits immediately |
+
+The handler's BSS is the ceiling of its memory usage. There is no heap growth path. A handler that processes a thousand messages uses the same memory on message 1000 as on message 1 — because there is no accumulation, only static buffers written and rewritten.
+
+---
+
+> The runtime does not know what a message means.
+> The handler does not know where the message came from.
+> The bus does not know who is subscribed.
+> This is the design.

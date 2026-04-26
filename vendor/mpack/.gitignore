@@ -1,0 +1,20 @@
+
+# build files
+/.build/
+test/.build/
+coverage/
+*.swp
+*.gcov
+mpack-test-file
+mpack-test-blank-file
+/mpack-test-dir/
+/analysis/
+/docs/html/
+/vgcore.*
+/.ninja_deps
+/.ninja_log
+
+# other junk
+.directory
+/tags
+/examples/sax-example
