@@ -2,8 +2,7 @@
  *
  * Usage: ./client "list all engineers"
  *
- * Uses a unique session_id per invocation to skip stale responses
- * from previous in-flight requests.
+ * Uses a unique session_id per invocation to skip stale responses.
  */
 
 #define _GNU_SOURCE
@@ -13,12 +12,11 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 #include <time.h>
 #include <zmq.h>
 
-#define BUS_PUB "tcp://localhost:5557"
-#define BUS_SUB "tcp://localhost:5556"
+#define BUS_PUB    "tcp://localhost:5557"
+#define BUS_SUB    "tcp://localhost:5556"
 #define TIMEOUT_MS 120000
 
 int main(int argc, char** argv) {
@@ -27,7 +25,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* unique session_id from timestamp so stale responses are skipped */
     char session_id[32];
     snprintf(session_id, sizeof(session_id), "cli-%ld", (long)time(NULL));
 
@@ -39,7 +36,6 @@ int main(int argc, char** argv) {
 
     void* ctx = zmq_ctx_new();
 
-    /* subscribe before publishing to avoid missing the reply */
     void* sub = zmq_socket(ctx, ZMQ_SUB);
     zmq_connect(sub, BUS_SUB);
     zmq_setsockopt(sub, ZMQ_SUBSCRIBE, "agent_response", 14);
@@ -62,7 +58,6 @@ int main(int argc, char** argv) {
     items[0].socket = sub;
     items[0].events = ZMQ_POLLIN;
 
-    /* drain until we get a response matching our session_id */
     while (1) {
         if (zmq_poll(items, 1, TIMEOUT_MS) <= 0) {
             fprintf(stderr, "[client] timeout — no response\n");
@@ -79,7 +74,6 @@ int main(int argc, char** argv) {
         char* body = (char*)zmq_msg_data(&pay_msg);
         int   blen = (int)zmq_msg_size(&pay_msg);
 
-        /* skip responses that don't belong to this session */
         char needle[64];
         snprintf(needle, sizeof(needle), "\"session_id\":\"%s\"", session_id);
         if (memmem(body, (size_t)blen, needle, strlen(needle)) == NULL) {

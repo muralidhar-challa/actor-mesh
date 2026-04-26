@@ -193,15 +193,6 @@ static size_t lmdb_count(MDB_dbi dbi) {
 
 /* ── Handler ─────────────────────────────────────────────────────────────── */
 
-static void uuid_to_hex(const uint8_t id[16], char out[33]) {
-    static const char h[] = "0123456789abcdef";
-    for (int i = 0; i < 16; i++) {
-        out[i*2]   = h[id[i] >> 4];
-        out[i*2+1] = h[id[i] & 0xf];
-    }
-    out[32] = '\0';
-}
-
 /* invoke_handler forks the handler, writes payload to stdin,
  * reads result into g_result_buf (static, no malloc).
  * Returns result length, -1 on error, -2 if result exceeds cap. */
@@ -226,9 +217,9 @@ static ssize_t invoke_handler(const actor_header_t* hdr,
 
         /* expose header fields as env vars — read-only visibility for handler */
         char id_hex[33], corr_hex[33], caus_hex[33], attempt_str[12];
-        uuid_to_hex(hdr->id,             id_hex);
-        uuid_to_hex(hdr->correlation_id, corr_hex);
-        uuid_to_hex(hdr->causation_id,   caus_hex);
+        actor_uuid_hex(hdr->id,             id_hex);
+        actor_uuid_hex(hdr->correlation_id, corr_hex);
+        actor_uuid_hex(hdr->causation_id,   caus_hex);
         snprintf(attempt_str, sizeof(attempt_str), "%d", hdr->attempt);
         setenv("ACTOR_TUPLE_ID",       id_hex,      1);
         setenv("ACTOR_CORRELATION_ID", corr_hex,    1);

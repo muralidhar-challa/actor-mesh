@@ -1,8 +1,7 @@
 *.db
 actor
 zmq-proxy
-client
-uuid7
-handlers/llm-agent
-handlers/sqlite-tool
+examples/employee-mesh/client
+examples/employee-mesh/handlers/llm-agent
+examples/employee-mesh/handlers/sqlite-tool
 /tmp/

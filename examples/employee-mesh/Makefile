@@ -1,29 +1,56 @@
-# Makefile — employee mesh
+# Makefile — employee mesh demo
 #
-# ── What this does ─────────────────────────────────────────────────────────
-#   A simple employee Q&A mesh:
-#     gateway     →  receives user questions
-#     sqlite-tool →  queries employee SQLite DB
-#     llm-agent   →  calls Ollama to answer using query results
+# ── Build ──────────────────────────────────────────────────────────────────
+#   make all              build client + handlers
+#   make clean            remove local binaries
 #
-# ── Quick start ────────────────────────────────────────────────────────────
-#   make build        build actor + proxy binaries
-#   make run          start full mesh
-#   make query Q="list all engineers"   send a test query
-#   make stop         stop all mesh processes
+# ── Run ────────────────────────────────────────────────────────────────────
+#   make run              start proxy + all actors
+#   make stop             kill all mesh processes + wipe LMDB
+#   make query Q="list all engineers"
 #
-# ── Dependencies ───────────────────────────────────────────────────────────
-#   apt install libzmq3-dev liblmdb-dev sqlite3
-#   Ollama running locally: https://ollama.ai
-#   curl, jq — available on alpine/ubuntu
+# ── Prerequisites ──────────────────────────────────────────────────────────
+#   Build runtime first:  cd ../.. && make
+#   Deps: libzmq3-dev liblmdb-dev libcurl-devel sqlite3-devel
+#   Ollama running locally
+
+ROOT    = ../..
+RUNTIME = $(ROOT)/runtime
+VENDOR  = $(ROOT)/vendor
+
+CC           = gcc
+CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/cjson
+LIBS         = -lzmq -llmdb
+HANDLER_LIBS = -lcurl -llmdb -lsqlite3
+CJSON        = $(VENDOR)/cjson/cJSON.c
+
+ACTOR  = $(ROOT)/actor
+PROXY  = $(ROOT)/zmq-proxy
+
+# ── Build ──────────────────────────────────────────────────────────────────
+
+.PHONY: all client handlers clean
+
+all: client handlers
+
+client: client.c
+	$(CC) $(CFLAGS) client.c $(LIBS) -o client
+
+handlers: handlers/llm-agent handlers/sqlite-tool
+
+handlers/llm-agent: handlers/llm-agent.c $(CJSON)
+	$(CC) $(CFLAGS) handlers/llm-agent.c $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
+
+handlers/sqlite-tool: handlers/sqlite-tool.c $(CJSON)
+	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(CJSON) -lsqlite3 -o handlers/sqlite-tool
+
+clean:
+	rm -f client handlers/llm-agent handlers/sqlite-tool
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
-ACTOR_BIN   ?= ../actor-mesh/actor
-PROXY_BIN   ?= ../actor-mesh/zmq-proxy
-LMDB_BASE   ?= /tmp/employee-mesh/lmdb
-EMPLOYEE_DB ?= $(dir $(abspath $(lastword $(MAKEFILE_LIST))))db/employees.db
-SQLITE_LOG  ?= /tmp/employee-mesh/gateway.db
+LMDB_BASE   ?= /tmp/actor-mesh
+EMPLOYEE_DB ?= $(abspath db/employee.db)
 
 # ── Bus ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +62,7 @@ BUS_PUB         ?= tcp://localhost:5557
 # ── Ollama ─────────────────────────────────────────────────────────────────
 
 OLLAMA_URL   ?= http://localhost:11434
-OLLAMA_MODEL ?= llama3.2
+OLLAMA_MODEL ?= gemma4:e2b
 
 # ── Common actor env ───────────────────────────────────────────────────────
 
@@ -45,56 +72,27 @@ COMMON_ENV = \
 	ACTOR_HEARTBEAT_MS=5000 \
 	ACTOR_RETRY_MAX=3
 
-# ── Targets ────────────────────────────────────────────────────────────────
-
-.PHONY: all build run stop \
-        run-proxy run-gateway run-sqlite-tool run-llm-agent \
-        query logs clean
-
-all: build
-
-# ── Build ──────────────────────────────────────────────────────────────────
-
-build:
-	@$(MAKE) -C ../actor-mesh all
-	@echo "[build] actor and proxy ready"
-
 # ── Run ────────────────────────────────────────────────────────────────────
 
-run: run-proxy run-sqlite-tool run-llm-agent run-gateway
+.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent query
+
+run: run-proxy run-sqlite-tool run-llm-agent
 	@echo "[mesh] employee mesh running"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
-	@pkill -f zmq-proxy || true
-	@pkill -f './actor'  || true
+	@pkill -9 -f zmq-proxy   || true
+	@pkill -9 -f './actor'   || true
+	@rm -rf $(LMDB_BASE)
 	@echo "[mesh] stopped"
-
-# ── Proxy ──────────────────────────────────────────────────────────────────
 
 run-proxy:
 	@mkdir -p $(LMDB_BASE)
 	PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
 	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
-	$(PROXY_BIN) &
+	$(PROXY) &
 	@sleep 0.2
 	@echo "[proxy] started"
-
-# ── Gateway ────────────────────────────────────────────────────────────────
-
-run-gateway:
-	@mkdir -p $(LMDB_BASE)/gateway
-	$(COMMON_ENV) \
-	ACTOR_ID=gateway-1 \
-	ACTOR_TOPIC=user_message \
-	ACTOR_RESULT_TOPIC=sql_query \
-	ACTOR_HANDLER="sh handlers/gateway.sh" \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/gateway \
-	SQLITE_LOG=$(SQLITE_LOG) \
-	$(ACTOR_BIN) &
-	@echo "[actor] gateway started"
-
-# ── SQLite Tool ────────────────────────────────────────────────────────────
 
 run-sqlite-tool:
 	@mkdir -p $(LMDB_BASE)/sqlite-tool
@@ -102,48 +100,29 @@ run-sqlite-tool:
 	ACTOR_ID=sqlite-tool-1 \
 	ACTOR_TOPIC=sql_query \
 	ACTOR_RESULT_TOPIC=sql_result \
-	ACTOR_HANDLER="sh handlers/sqlite-tool.sh" \
+	ACTOR_HANDLER=$(abspath handlers/sqlite-tool) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR_BIN) &
+	$(ACTOR) &
 	@echo "[actor] sqlite-tool started"
-
-# ── LLM Agent ─────────────────────────────────────────────────────────────
 
 run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent
 	$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=sql_result \
+	ACTOR_TOPIC=user_message,sql_result \
 	ACTOR_RESULT_TOPIC=agent_response \
-	ACTOR_HANDLER="sh handlers/llm-agent.sh" \
+	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 	OLLAMA_URL=$(OLLAMA_URL) \
 	OLLAMA_MODEL=$(OLLAMA_MODEL) \
-	$(ACTOR_BIN) &
+	EMPLOYEE_DB=$(EMPLOYEE_DB) \
+	$(ACTOR) &
 	@echo "[actor] llm-agent started"
 
-# ── Test query ─────────────────────────────────────────────────────────────
+# ── Query ──────────────────────────────────────────────────────────────────
 
 Q ?= list all employees
 
 query:
-	@echo "[query] sending: $(Q)"
-	@echo '{"type":"user_message","query":"$(Q)","session_id":"test-001"}' | \
-		curl -s -X POST http://localhost:8080 \
-		-H "content-type: application/json" \
-		-d @- | jq .
-
-# ── Logs ───────────────────────────────────────────────────────────────────
-
-logs:
-	@sqlite3 $(SQLITE_LOG) \
-		"SELECT datetime(emitted_at/1000000000,'unixepoch'), topic, origin \
-		 FROM thread_log ORDER BY emitted_at DESC LIMIT 20" 2>/dev/null \
-		|| echo "[logs] no thread log yet"
-
-# ── Clean ──────────────────────────────────────────────────────────────────
-
-clean:
-	@rm -rf /tmp/employee-mesh
-	@echo "[clean] done"
+	@./client "$(Q)"

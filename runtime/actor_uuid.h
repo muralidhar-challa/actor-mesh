@@ -30,7 +30,7 @@ static inline void actor_uuid_gen(uint8_t dst[16]) {
 
     uint8_t rnd[10];
 #ifdef __linux__
-    if (getrandom(rnd, sizeof(rand), 0) != (ssize_t)sizeof(rand)) {
+    if (getrandom(rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)) {
         for (int i = 0; i < 10; i++) rnd[i] = (uint8_t)rand();
     }
 #else
@@ -57,6 +57,17 @@ static inline void actor_uuid_gen(uint8_t dst[16]) {
 
     /* bytes 9-15: 56 rand bits */
     memcpy(dst + 9, rnd + 3, 7);
+}
+
+/* actor_uuid_hex formats a 16-byte uuid as a 32-char lowercase hex string (no dashes).
+ * dst must be at least 33 bytes. */
+static inline void actor_uuid_hex(const uint8_t src[16], char dst[33]) {
+    static const char h[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        dst[i*2]   = h[src[i] >> 4];
+        dst[i*2+1] = h[src[i] & 0xf];
+    }
+    dst[32] = '\0';
 }
 
 /* actor_uuid_str formats a 16-byte uuid as a 36-char null-terminated string.

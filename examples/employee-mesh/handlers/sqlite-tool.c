@@ -4,13 +4,11 @@
  * Receives: sql_query  { "sql": "SELECT ..." }
  * Emits:    sql_result { "rows": [...] }
  *
- * Correlation chain is carried by the actor runtime — no session tracking needed.
- *
  * Env: EMPLOYEE_DB
  * Deps: libsqlite3, cJSON
  */
 
-#include "../vendor/cjson/cJSON.h"
+#include "cJSON.h"
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +18,7 @@
 #define MAX_ROWS  20
 
 static char g_in[MAX_IN];
+static char g_capped[MAX_IN + 40];
 
 static void emit_error(const char* msg) {
     cJSON* e = cJSON_CreateObject();
@@ -57,14 +56,12 @@ int main(void) {
     }
 
     /* wrap in a LIMIT cap so the tool can never return unbounded rows */
-    char capped[4096];
-    snprintf(capped, sizeof(capped),
-             "SELECT * FROM (%s) LIMIT %d", sql, MAX_ROWS);
+    snprintf(g_capped, sizeof(g_capped), "SELECT * FROM (%s) LIMIT %d", sql, MAX_ROWS);
 
     cJSON* rows = cJSON_CreateArray();
     sqlite3_stmt* stmt;
 
-    if (sqlite3_prepare_v2(db, capped, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, g_capped, -1, &stmt, NULL) == SQLITE_OK) {
         int ncols = sqlite3_column_count(stmt);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             cJSON* row = cJSON_CreateObject();
@@ -91,8 +88,7 @@ int main(void) {
         }
         sqlite3_finalize(stmt);
     } else {
-        fprintf(stderr, "[sqlite-tool] prepare failed: %s\n",
-                sqlite3_errmsg(db));
+        fprintf(stderr, "[sqlite-tool] prepare failed: %s\n", sqlite3_errmsg(db));
     }
 
     sqlite3_close(db);
