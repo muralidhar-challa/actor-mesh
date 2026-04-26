@@ -2,21 +2,22 @@
 /*
  * handlers/llm-agent.c — agentic ReAct loop handler
  *
- * Receives: user_message  { "type": "user_message", "query": "...", "session_id": "..." }
- *           sql_result    { "type": "sql_result",   "rows": [...] }
+ * Receives: mpack user_message  {type, query, session_id}
+ *           mpack sql_result    {type, rows:[{col:val,...},...]}
  *
- * Emits:    sql_query\n{"type":"sql_query","sql":"..."}
- *        or agent_response\n{"type":"agent_response","answer":"...","query":"...","session_id":"..."}
+ * Emits:    sql_query\n    mpack {type:"sql_query",  sql:"..."}
+ *        or agent_response\n mpack {type:"agent_response", answer, query, session_id}
  *
  * State lives in LMDB keyed by ACTOR_CORRELATION_ID.
  * Zero dynamic allocation — all buffers are static file-scope arrays.
- * cJSON is used for parse/emit (its internal allocs are fine).
+ * mpack for mesh I/O; cJSON for Ollama HTTP (complex nested tool JSON).
  *
  * Env: OLLAMA_URL, OLLAMA_MODEL, EMPLOYEE_DB, ACTOR_LMDB_PATH, ACTOR_CORRELATION_ID
- * Deps: libcurl, liblmdb, libsqlite3, cJSON
+ * Deps: libcurl, liblmdb, libsqlite3, mpack, cJSON
  */
 
 #include "cJSON.h"
+#include "mpack.h"
 #include <curl/curl.h>
 #include <lmdb.h>
 #include <sqlite3.h>
@@ -30,6 +31,8 @@
 #define MAX_SCHEMA  (64  * 1024)
 #define MAX_META    (8   * 1024)
 #define MAX_SYS     (128 * 1024)
+#define MAX_ROWS_J  (128 * 1024)
+#define MAX_OUT     (1   * 1024 * 1024)
 #define MAX_ROUNDS  6
 
 static char   g_in[MAX_IN];
@@ -42,6 +45,8 @@ static char   g_titles[MAX_META];
 static char   g_sys[MAX_SYS];
 static char   g_query[4096];
 static char   g_session[256];
+static char   g_rows_json[MAX_ROWS_J];
+static char   g_out[MAX_OUT];
 
 /* ── curl: write into static g_resp ─────────────────────────────────────── */
 
@@ -70,7 +75,6 @@ static MDB_env* lmdb_open(void) {
 
 /* returns pointer into g_state_buf, or NULL */
 static const char* state_load(MDB_env* env, const char* key) {
-    /* named DBs must be opened from a write txn in a fresh MDB_env */
     MDB_txn* txn;
     if (mdb_txn_begin(env, NULL, 0, &txn)) return NULL;
     MDB_dbi dbi;
@@ -245,38 +249,117 @@ static cJSON* make_tools(void) {
     return tools;
 }
 
-/* ── Emit helpers ────────────────────────────────────────────────────────── */
+/* ── mpack input: decode rows array into g_rows_json ────────────────────── */
+
+static void decode_rows_to_json(mpack_reader_t* r) {
+    size_t len = 0;
+    size_t cap = sizeof(g_rows_json);
+
+#define JA(s) do { \
+    size_t _l = strlen(s); \
+    if (len + _l + 1 < cap) { memcpy(g_rows_json + len, s, _l); len += _l; } \
+} while(0)
+
+    uint32_t nrows = mpack_expect_array_max(r, 100);
+    if (len + 1 < cap) g_rows_json[len++] = '[';
+
+    for (uint32_t row = 0; row < nrows && mpack_reader_error(r) == mpack_ok; row++) {
+        if (row > 0 && len + 1 < cap) g_rows_json[len++] = ',';
+        if (len + 1 < cap) g_rows_json[len++] = '{';
+
+        uint32_t ncols = mpack_expect_map_max(r, 64);
+        for (uint32_t col = 0; col < ncols && mpack_reader_error(r) == mpack_ok; col++) {
+            if (col > 0 && len + 1 < cap) g_rows_json[len++] = ',';
+
+            char colname[64];
+            mpack_expect_cstr(r, colname, sizeof(colname));
+            if (len + 1 < cap) g_rows_json[len++] = '"';
+            JA(colname);
+            if (len + 2 < cap) { g_rows_json[len++] = '"'; g_rows_json[len++] = ':'; }
+
+            mpack_tag_t tag = mpack_peek_tag(r);
+            char tmp[32];
+            switch (mpack_tag_type(&tag)) {
+                case mpack_type_int:
+                    snprintf(tmp, sizeof(tmp), "%lld", (long long)mpack_expect_i64(r));
+                    JA(tmp);
+                    break;
+                case mpack_type_uint:
+                    snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)mpack_expect_u64(r));
+                    JA(tmp);
+                    break;
+                case mpack_type_float:
+                    snprintf(tmp, sizeof(tmp), "%g", (double)mpack_expect_float(r));
+                    JA(tmp);
+                    break;
+                case mpack_type_double:
+                    snprintf(tmp, sizeof(tmp), "%g", mpack_expect_double(r));
+                    JA(tmp);
+                    break;
+                case mpack_type_str: {
+                    char sv[512];
+                    mpack_expect_cstr(r, sv, sizeof(sv));
+                    if (len + 1 < cap) g_rows_json[len++] = '"';
+                    for (const char* p = sv; *p && len + 3 < cap; p++) {
+                        if (*p == '"' || *p == '\\') g_rows_json[len++] = '\\';
+                        else if ((unsigned char)*p < 0x20) { len++; g_rows_json[len-1] = '?'; continue; }
+                        g_rows_json[len++] = *p;
+                    }
+                    if (len + 1 < cap) g_rows_json[len++] = '"';
+                    break;
+                }
+                default:
+                    mpack_discard(r);
+                    JA("null");
+                    break;
+            }
+        }
+        mpack_done_map(r);
+        if (len + 1 < cap) g_rows_json[len++] = '}';
+    }
+
+    mpack_done_array(r);
+    if (len + 1 < cap) g_rows_json[len++] = ']';
+    g_rows_json[len < cap ? len : cap - 1] = '\0';
+
+#undef JA
+}
+
+/* ── mpack emit helpers ──────────────────────────────────────────────────── */
 
 static void emit_sql_query(const char* sql) {
-    cJSON* o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "sql_query");
-    cJSON_AddStringToObject(o, "sql",  sql);
-    char* s = cJSON_PrintUnformatted(o);
+    mpack_writer_t w;
+    mpack_writer_init(&w, g_out, sizeof(g_out));
+    mpack_start_map(&w, 2);
+    mpack_write_cstr(&w, "type"); mpack_write_cstr(&w, "sql_query");
+    mpack_write_cstr(&w, "sql");  mpack_write_cstr(&w, sql);
+    mpack_finish_map(&w);
+    size_t used = mpack_writer_buffer_used(&w);
+    mpack_writer_destroy(&w);
     fputs("sql_query\n", stdout);
-    fputs(s, stdout);
-    free(s);
-    cJSON_Delete(o);
+    fwrite(g_out, 1, used, stdout);
 }
 
 static void emit_agent_response(const char* answer, const char* query,
                                 const char* session_id) {
-    cJSON* o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type",       "agent_response");
-    cJSON_AddStringToObject(o, "answer",     answer     ? answer     : "");
-    cJSON_AddStringToObject(o, "query",      query      ? query      : "");
-    cJSON_AddStringToObject(o, "session_id", session_id ? session_id : "");
-    char* s = cJSON_PrintUnformatted(o);
+    mpack_writer_t w;
+    mpack_writer_init(&w, g_out, sizeof(g_out));
+    mpack_start_map(&w, 4);
+    mpack_write_cstr(&w, "type");       mpack_write_cstr(&w, "agent_response");
+    mpack_write_cstr(&w, "answer");     mpack_write_cstr(&w, answer     ? answer     : "");
+    mpack_write_cstr(&w, "query");      mpack_write_cstr(&w, query      ? query      : "");
+    mpack_write_cstr(&w, "session_id"); mpack_write_cstr(&w, session_id ? session_id : "");
+    mpack_finish_map(&w);
+    size_t used = mpack_writer_buffer_used(&w);
+    mpack_writer_destroy(&w);
     fputs("agent_response\n", stdout);
-    fputs(s, stdout);
-    free(s);
-    cJSON_Delete(o);
+    fwrite(g_out, 1, used, stdout);
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 int main(void) {
     size_t n = fread(g_in, 1, sizeof(g_in) - 1, stdin);
-    g_in[n] = '\0';
 
     const char* corr_id = getenv("ACTOR_CORRELATION_ID");
     const char* ollama  = getenv("OLLAMA_URL");   if (!ollama)  ollama  = "http://localhost:11434";
@@ -288,24 +371,44 @@ int main(void) {
         return 1;
     }
 
-    cJSON* payload = cJSON_Parse(g_in);
-    if (!payload) {
-        emit_agent_response("internal error: bad payload json", "", "");
+    /* decode mpack input */
+    char in_type[32] = {0};
+    g_query[0] = g_session[0] = g_rows_json[0] = '\0';
+
+    mpack_reader_t rdr;
+    mpack_reader_init_data(&rdr, g_in, n);
+
+    static const char* in_keys[] = { "type", "query", "session_id", "rows" };
+    bool in_found[4] = { false, false, false, false };
+
+    uint32_t in_sz = mpack_expect_map_max(&rdr, 8);
+    for (uint32_t i = 0; i < in_sz && mpack_reader_error(&rdr) == mpack_ok; i++) {
+        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 4)) {
+            case 0: mpack_expect_cstr(&rdr, in_type,  sizeof(in_type));  break;
+            case 1: mpack_expect_cstr(&rdr, g_query,  sizeof(g_query));  break;
+            case 2: mpack_expect_cstr(&rdr, g_session, sizeof(g_session)); break;
+            case 3: decode_rows_to_json(&rdr); break;
+            default: mpack_discard(&rdr); break;
+        }
+    }
+    mpack_done_map(&rdr);
+
+    if (mpack_reader_error(&rdr) != mpack_ok || !in_type[0]) {
+        mpack_reader_destroy(&rdr);
+        emit_agent_response("internal error: bad mpack input", "", "");
         return 1;
     }
-
-    const char* type = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "type"));
+    mpack_reader_destroy(&rdr);
 
     MDB_env* env    = lmdb_open();
     cJSON*   messages = NULL;
     int      round    = 0;
 
-    if (type && strcmp(type, "sql_result") == 0) {
+    if (strcmp(in_type, "sql_result") == 0) {
         /* Round 2+: load conversation state from LMDB */
         const char* raw = env ? state_load(env, corr_id) : NULL;
         if (!raw) {
             fprintf(stderr, "[llm-agent] no state for corr=%s, discarding\n", corr_id);
-            cJSON_Delete(payload);
             if (env) mdb_env_close(env);
             return 0;
         }
@@ -332,28 +435,19 @@ int main(void) {
             }
         }
 
-        /* append tool result message */
-        cJSON* rows = cJSON_GetObjectItem(payload, "rows");
-        cJSON* empty_rows = rows ? NULL : cJSON_CreateArray();
-        char*  rows_str   = cJSON_PrintUnformatted(rows ? rows : empty_rows);
-        if (empty_rows) cJSON_Delete(empty_rows);
+        /* append tool result message using rows JSON decoded from mpack input */
+        const char* rows_str = g_rows_json[0] ? g_rows_json : "[]";
 
         cJSON* tool_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(tool_msg, "role",    "tool");
         cJSON_AddStringToObject(tool_msg, "content", rows_str);
-        free(rows_str);
         if (last_tc_id)
             cJSON_AddStringToObject(tool_msg, "tool_call_id",
                                     cJSON_GetStringValue(last_tc_id));
         cJSON_AddItemToArray(messages, tool_msg);
 
     } else {
-        /* Round 1: fresh conversation from user_message */
-        const char* q   = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "query"));
-        const char* sid = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "session_id"));
-        snprintf(g_query,   sizeof(g_query),   "%s", q   ? q   : "");
-        snprintf(g_session, sizeof(g_session), "%s", sid ? sid : "");
-
+        /* Round 1: fresh conversation from user_message (g_query/g_session set by mpack decode) */
         make_system_prompt(db_path);
 
         messages = cJSON_CreateArray();
@@ -368,8 +462,6 @@ int main(void) {
         cJSON_AddStringToObject(usr_msg, "content", g_query);
         cJSON_AddItemToArray(messages, usr_msg);
     }
-
-    cJSON_Delete(payload);
 
     if (round >= MAX_ROUNDS) {
         emit_agent_response("(max rounds reached without a final answer)", g_query, g_session);

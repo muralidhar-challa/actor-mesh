@@ -19,10 +19,19 @@ RUNTIME = $(ROOT)/runtime
 VENDOR  = $(ROOT)/vendor
 
 CC           = gcc
-CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/cjson
+CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack
 LIBS         = -lzmq -llmdb
 HANDLER_LIBS = -lcurl -llmdb -lsqlite3
-CJSON        = $(VENDOR)/cjson/cJSON.c
+
+MPACK_SRCS = \
+	$(VENDOR)/mpack/src/mpack/mpack-common.c \
+	$(VENDOR)/mpack/src/mpack/mpack-platform.c \
+	$(VENDOR)/mpack/src/mpack/mpack-reader.c \
+	$(VENDOR)/mpack/src/mpack/mpack-writer.c \
+	$(VENDOR)/mpack/src/mpack/mpack-expect.c \
+	$(VENDOR)/mpack/src/mpack/mpack-node.c
+
+CJSON = $(VENDOR)/cjson/cJSON.c
 
 ACTOR  = $(ROOT)/actor
 PROXY  = $(ROOT)/zmq-proxy
@@ -33,16 +42,16 @@ PROXY  = $(ROOT)/zmq-proxy
 
 all: client handlers
 
-client: client.c
-	$(CC) $(CFLAGS) client.c $(LIBS) -o client
+client: client.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) client.c $(MPACK_SRCS) $(LIBS) -o client
 
 handlers: handlers/llm-agent handlers/sqlite-tool
 
-handlers/llm-agent: handlers/llm-agent.c $(CJSON)
-	$(CC) $(CFLAGS) handlers/llm-agent.c $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
+handlers/llm-agent: handlers/llm-agent.c $(MPACK_SRCS) $(CJSON)
+	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
 
-handlers/sqlite-tool: handlers/sqlite-tool.c $(CJSON)
-	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(CJSON) -lsqlite3 -o handlers/sqlite-tool
+handlers/sqlite-tool: handlers/sqlite-tool.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o handlers/sqlite-tool
 
 clean:
 	rm -f client handlers/llm-agent handlers/sqlite-tool
@@ -88,7 +97,7 @@ stop:
 
 run-proxy:
 	@mkdir -p $(LMDB_BASE)
-	PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
+	@PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
 	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
 	$(PROXY) &
 	@sleep 0.2
@@ -96,7 +105,7 @@ run-proxy:
 
 run-sqlite-tool:
 	@mkdir -p $(LMDB_BASE)/sqlite-tool
-	$(COMMON_ENV) \
+	@$(COMMON_ENV) \
 	ACTOR_ID=sqlite-tool-1 \
 	ACTOR_TOPIC=sql_query \
 	ACTOR_RESULT_TOPIC=sql_result \
@@ -108,7 +117,7 @@ run-sqlite-tool:
 
 run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent
-	$(COMMON_ENV) \
+	@$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
 	ACTOR_TOPIC=user_message,sql_result \
 	ACTOR_RESULT_TOPIC=agent_response \
