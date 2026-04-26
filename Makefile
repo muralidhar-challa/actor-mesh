@@ -28,9 +28,12 @@ endif
 
 # ── Build targets ──────────────────────────────────────────────────────────
 
-.PHONY: all actor proxy client clean
+.PHONY: all actor proxy client handlers clean
 
-all: actor proxy client
+HANDLER_LIBS = -lcurl -llmdb -lsqlite3
+CJSON        = vendor/cjson/cJSON.c
+
+all: actor proxy client handlers
 
 actor: runtime/main.c runtime/actor.c runtime/actor.h \
        runtime/actor_tuple.h runtime/actor_uuid.h
@@ -42,8 +45,16 @@ proxy: proxy/proxy.c
 client: client.c runtime/actor_tuple.h runtime/actor_uuid.h
 	$(CC) $(CFLAGS) client.c $(LIBS) -o client
 
+handlers: handlers/llm-agent handlers/sqlite-tool
+
+handlers/llm-agent: handlers/llm-agent.c $(CJSON)
+	$(CC) $(CFLAGS) handlers/llm-agent.c $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
+
+handlers/sqlite-tool: handlers/sqlite-tool.c $(CJSON)
+	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(CJSON) -lsqlite3 -o handlers/sqlite-tool
+
 clean:
-	rm -f actor zmq-proxy client
+	rm -f actor zmq-proxy client handlers/llm-agent handlers/sqlite-tool
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -73,15 +84,16 @@ COMMON_ENV = \
 
 # ── Run targets ────────────────────────────────────────────────────────────
 
-.PHONY: run stop run-proxy run-gateway run-sqlite-tool run-llm-agent query logs
+.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent query logs
 
-run: run-proxy run-sqlite-tool run-llm-agent run-gateway
+run: run-proxy run-sqlite-tool run-llm-agent
 	@echo "[mesh] employee mesh running"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
 	@pkill -9 -f zmq-proxy || true
 	@pkill -9 -f './actor'  || true
+	@rm -rf $(LMDB_BASE)
 	@echo "[mesh] stopped"
 
 # ── Proxy ──────────────────────────────────────────────────────────────────
@@ -94,20 +106,6 @@ run-proxy:
 	@sleep 0.2
 	@echo "[proxy] started"
 
-# ── Gateway ────────────────────────────────────────────────────────────────
-
-run-gateway:
-	@mkdir -p $(LMDB_BASE)/gateway
-	$(COMMON_ENV) \
-	ACTOR_ID=gateway-1 \
-	ACTOR_TOPIC=user_message \
-	ACTOR_RESULT_TOPIC=sql_query \
-	ACTOR_HANDLER="sh handlers/gateway.sh" \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/gateway \
-	SQLITE_LOG=$(SQLITE_LOG) \
-	./actor &
-	@echo "[actor] gateway started"
-
 # ── SQLite Tool ────────────────────────────────────────────────────────────
 
 run-sqlite-tool:
@@ -116,7 +114,7 @@ run-sqlite-tool:
 	ACTOR_ID=sqlite-tool-1 \
 	ACTOR_TOPIC=sql_query \
 	ACTOR_RESULT_TOPIC=sql_result \
-	ACTOR_HANDLER="sh handlers/sqlite-tool.sh" \
+	ACTOR_HANDLER=./handlers/sqlite-tool \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
 	./actor &
@@ -128,9 +126,9 @@ run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent
 	$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=user_message \
+	ACTOR_TOPIC=user_message,sql_result \
 	ACTOR_RESULT_TOPIC=agent_response \
-	ACTOR_HANDLER="sh handlers/llm-agent.sh" \
+	ACTOR_HANDLER=./handlers/llm-agent \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 	OLLAMA_URL=$(OLLAMA_URL) \
 	OLLAMA_MODEL=$(OLLAMA_MODEL) \

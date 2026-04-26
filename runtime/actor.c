@@ -128,7 +128,16 @@ static int zmq_setup(void) {
         return -1;
     }
 
-    zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, cfg.topic, strlen(cfg.topic));
+    /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result" */
+    char topic_buf[256];
+    strncpy(topic_buf, cfg.topic, sizeof(topic_buf) - 1);
+    topic_buf[sizeof(topic_buf) - 1] = '\0';
+    char* tok = strtok(topic_buf, ",");
+    while (tok) {
+        while (*tok == ' ') tok++;
+        zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, tok, strlen(tok));
+        tok = strtok(NULL, ",");
+    }
     return 0;
 }
 
@@ -184,10 +193,21 @@ static size_t lmdb_count(MDB_dbi dbi) {
 
 /* ── Handler ─────────────────────────────────────────────────────────────── */
 
+static void uuid_to_hex(const uint8_t id[16], char out[33]) {
+    static const char h[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i*2]   = h[id[i] >> 4];
+        out[i*2+1] = h[id[i] & 0xf];
+    }
+    out[32] = '\0';
+}
+
 /* invoke_handler forks the handler, writes payload to stdin,
  * reads result into g_result_buf (static, no malloc).
  * Returns result length, -1 on error, -2 if result exceeds cap. */
-static ssize_t invoke_handler(const uint8_t* payload, size_t payload_len) {
+static ssize_t invoke_handler(const actor_header_t* hdr,
+                              const uint8_t*        payload,
+                              size_t                payload_len) {
     int to_handler[2];
     int from_handler[2];
 
@@ -203,6 +223,19 @@ static ssize_t invoke_handler(const uint8_t* payload, size_t payload_len) {
         dup2(from_handler[1], STDOUT_FILENO);
         close(to_handler[0]);  close(to_handler[1]);
         close(from_handler[0]); close(from_handler[1]);
+
+        /* expose header fields as env vars — read-only visibility for handler */
+        char id_hex[33], corr_hex[33], caus_hex[33], attempt_str[12];
+        uuid_to_hex(hdr->id,             id_hex);
+        uuid_to_hex(hdr->correlation_id, corr_hex);
+        uuid_to_hex(hdr->causation_id,   caus_hex);
+        snprintf(attempt_str, sizeof(attempt_str), "%d", hdr->attempt);
+        setenv("ACTOR_TUPLE_ID",       id_hex,      1);
+        setenv("ACTOR_CORRELATION_ID", corr_hex,    1);
+        setenv("ACTOR_CAUSATION_ID",   caus_hex,    1);
+        setenv("ACTOR_TUPLE_ORIGIN",   hdr->origin, 1);
+        setenv("ACTOR_ATTEMPT",        attempt_str, 1);
+
         execl("/bin/sh", "sh", "-c", cfg.handler, NULL);
         _exit(1);
     }
@@ -251,27 +284,64 @@ static ssize_t invoke_handler(const uint8_t* payload, size_t payload_len) {
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
 
+/* If handler output begins with a bare topic name on its own line
+ * (e.g. "sql_query\n{...}"), use that topic and skip the prefix line.
+ * Otherwise fall back to cfg.result_topic and use the full buffer.
+ * A valid topic prefix: only [a-zA-Z0-9_] chars followed immediately by '\n'. */
+static const char* result_topic(size_t result_len, size_t* payload_off) {
+    *payload_off = 0;
+    const char* p = (const char*)g_result_buf;
+    size_t i = 0;
+    while (i < result_len && i < 31) {
+        char c = p[i];
+        if (c == '\n') {
+            if (i == 0) break;           /* empty first line — no override   */
+            *payload_off = i + 1;
+            return p;                    /* caller uses p[0..i-1] as topic   */
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||  c == '_')) {
+            break;                       /* non-identifier char — no override */
+        }
+        i++;
+    }
+    return cfg.result_topic;            /* default */
+}
+
 static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
-    /* build result header */
+    size_t        payload_off  = 0;
+    const char*   raw_topic    = result_topic(result_len, &payload_off);
+
+    /* if the handler wrote a topic prefix, null-terminate it in the buffer */
+    char topic_buf[32] = {0};
+    if (payload_off > 0) {
+        size_t tlen = payload_off - 1;   /* exclude the '\n' */
+        if (tlen >= sizeof(topic_buf)) tlen = sizeof(topic_buf) - 1;
+        memcpy(topic_buf, raw_topic, tlen);
+    } else {
+        strncpy(topic_buf, raw_topic, sizeof(topic_buf) - 1);
+    }
+
+    const uint8_t* payload     = g_result_buf + payload_off;
+    size_t         payload_len = result_len   - payload_off;
+
     actor_header_t out_hdr;
     actor_tuple_init(&out_hdr,
-                     cfg.result_topic,
+                     topic_buf,
                      cfg.id,
                      in_hdr->correlation_id,
                      in_hdr->id,
-                     (uint32_t)result_len);
+                     (uint32_t)payload_len);
     actor_uuid_gen(out_hdr.id);
     out_hdr.ttl = cfg.ttl_ns;
 
-    /* assemble frame into static buffer for LMDB write */
-    size_t frame_len = sizeof(actor_header_t) + result_len;
+    size_t frame_len = sizeof(actor_header_t) + payload_len;
     memcpy(g_frame_buf, &out_hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), g_result_buf, result_len);
+    memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
     lmdb_put(dbi_outbox, out_hdr.id, 16, g_frame_buf, frame_len);
 
-    /* publish — zero copy from static buffers */
-    zmq_send(zmq_pub, &out_hdr,     sizeof(actor_header_t), ZMQ_SNDMORE);
-    zmq_send(zmq_pub, g_result_buf, result_len,             0);
+    zmq_send(zmq_pub, &out_hdr, sizeof(actor_header_t), ZMQ_SNDMORE);
+    zmq_send(zmq_pub, payload,  payload_len,             0);
 
     lmdb_del(dbi_outbox, out_hdr.id, 16);
 }
@@ -316,7 +386,7 @@ static void process_tuple(const actor_header_t* hdr,
     /* exponential backoff retry loop */
     int attempt = 0;
     while (attempt <= cfg.retry_max) {
-        ssize_t result_len = invoke_handler(payload, payload_len);
+        ssize_t result_len = invoke_handler(hdr, payload, payload_len);
 
         if (result_len >= 0) {
             publish_result(hdr, (size_t)result_len);
@@ -357,7 +427,7 @@ int actor_run(void) {
     if (zmq_setup()  < 0) return -1;
     if (lmdb_setup() < 0) return -1;
 
-    fprintf(stderr, "[actor] id=%s topic=%s handler=%s max_payload=%d\n",
+    fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d\n",
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD);
 
     zmq_pollitem_t items[1];

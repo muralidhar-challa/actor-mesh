@@ -1,1 +1,8 @@
 *.db
+actor
+zmq-proxy
+client
+uuid7
+handlers/llm-agent
+handlers/sqlite-tool
+/tmp/
