@@ -83,7 +83,7 @@ COMMON_ENV = \
 	ACTOR_BUS_PUB=$(BUS_PUB) \
 	ACTOR_HEARTBEAT_MS=5000 \
 	ACTOR_RETRY_MAX=3 \
-	ACTOR_TTL_NS=60000000000
+	ACTOR_TTL_NS=300000000000
 
 # ── Run ────────────────────────────────────────────────────────────────────
 

@@ -57,7 +57,10 @@
       "Bash(make query *)",
       "Bash(timeout 30 /tmp/test_query)",
       "Bash(fossil extras *)",
-      "Bash(timeout 120 /tmp/test_followup)"
+      "Bash(timeout 120 /tmp/test_followup)",
+      "Bash(timeout 600 /tmp/test_hardened)",
+      "Bash(sqlite3 /home/max/Projects/mesh-actors/examples/employee-mesh/db/employee.db ' *)",
+      "Bash(time sqlite3 *)"
     ]
   }
 }
