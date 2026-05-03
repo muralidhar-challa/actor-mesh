@@ -50,7 +50,13 @@
       "Bash(make client *)",
       "Bash(python3 -c ' *)",
       "Bash(pkg-config --libs --cflags llama)",
-      "Bash(ldconfig -p)"
+      "Bash(ldconfig -p)",
+      "Bash(fossil forget *)",
+      "Bash(fossil settings *)",
+      "Bash(make tui *)",
+      "Bash(make query *)",
+      "Bash(timeout 30 /tmp/test_query)",
+      "Bash(fossil extras *)"
     ]
   }
 }

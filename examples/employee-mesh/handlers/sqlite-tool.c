@@ -59,6 +59,14 @@ int main(void) {
 
     if (!sql_val[0]) { emit_error("missing sql field"); return 1; }
 
+    /* strip trailing whitespace and semicolons the LLM often appends */
+    {
+        size_t l = strlen(sql_val);
+        while (l > 0 && (sql_val[l-1] == ';' || sql_val[l-1] == ' '
+                         || sql_val[l-1] == '\n' || sql_val[l-1] == '\r'))
+            sql_val[--l] = '\0';
+    }
+
     const char* db_path = getenv("EMPLOYEE_DB");
     if (!db_path) db_path = "./employee.db";
 

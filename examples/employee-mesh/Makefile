@@ -38,12 +38,15 @@ PROXY  = $(ROOT)/zmq-proxy
 
 # ── Build ──────────────────────────────────────────────────────────────────
 
-.PHONY: all client handlers clean
+.PHONY: all client tui handlers clean
 
-all: client handlers
+all: client tui handlers
 
 client: client.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) client.c $(MPACK_SRCS) $(LIBS) -o client
+
+tui: tui.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o tui
 
 handlers: handlers/llm-agent handlers/sqlite-tool
 
@@ -54,7 +57,7 @@ handlers/sqlite-tool: handlers/sqlite-tool.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o handlers/sqlite-tool
 
 clean:
-	rm -f client handlers/llm-agent handlers/sqlite-tool
+	rm -f client tui handlers/llm-agent handlers/sqlite-tool
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -79,32 +82,35 @@ COMMON_ENV = \
 	ACTOR_BUS_SUB=$(BUS_SUB) \
 	ACTOR_BUS_PUB=$(BUS_PUB) \
 	ACTOR_HEARTBEAT_MS=5000 \
-	ACTOR_RETRY_MAX=3
+	ACTOR_RETRY_MAX=3 \
+	ACTOR_TTL_NS=60000000000
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent query
+.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent query chat
 
 run: run-proxy run-sqlite-tool run-llm-agent
 	@echo "[mesh] employee mesh running"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
-	@pkill -9 -f zmq-proxy   || true
-	@pkill -9 -f './actor'   || true
+	@pkill -9 zmq-proxy || true
+	@pkill -9 actor     || true
 	@rm -rf $(LMDB_BASE)
-	@echo "[mesh] stopped"
+	@echo "[mesh] stopped  (logs were in $(LOGDIR))"
+
+LOGDIR ?= /tmp/actor-mesh/logs
 
 run-proxy:
-	@mkdir -p $(LMDB_BASE)
+	@mkdir -p $(LMDB_BASE) $(LOGDIR)
 	@PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
 	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
-	$(PROXY) &
+	$(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
 	@sleep 0.2
-	@echo "[proxy] started"
+	@echo "[proxy] started  (log: $(LOGDIR)/proxy.log)"
 
 run-sqlite-tool:
-	@mkdir -p $(LMDB_BASE)/sqlite-tool
+	@mkdir -p $(LMDB_BASE)/sqlite-tool $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=sqlite-tool-1 \
 	ACTOR_TOPIC=sql_query \
@@ -112,11 +118,11 @@ run-sqlite-tool:
 	ACTOR_HANDLER=$(abspath handlers/sqlite-tool) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR) &
-	@echo "[actor] sqlite-tool started"
+	$(ACTOR) >>$(LOGDIR)/sqlite-tool.log 2>&1 &
+	@echo "[actor] sqlite-tool started  (log: $(LOGDIR)/sqlite-tool.log)"
 
 run-llm-agent:
-	@mkdir -p $(LMDB_BASE)/llm-agent
+	@mkdir -p $(LMDB_BASE)/llm-agent $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
 	ACTOR_TOPIC=user_message,sql_result \
@@ -126,12 +132,15 @@ run-llm-agent:
 	OLLAMA_URL=$(OLLAMA_URL) \
 	OLLAMA_MODEL=$(OLLAMA_MODEL) \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR) &
-	@echo "[actor] llm-agent started"
+	$(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
+	@echo "[actor] llm-agent started  (log: $(LOGDIR)/llm-agent.log)"
 
-# ── Query ──────────────────────────────────────────────────────────────────
+# ── Query / Chat ───────────────────────────────────────────────────────────
 
 Q ?= list all employees
 
 query:
 	@./client "$(Q)"
+
+chat:
+	@./tui

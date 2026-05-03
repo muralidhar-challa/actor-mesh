@@ -2,17 +2,22 @@
 /*
  * handlers/llm-agent.c — agentic ReAct loop handler
  *
- * Receives: mpack user_message  {type, query, session_id}
+ * Receives: mpack user_message  {type, query}
  *           mpack sql_result    {type, rows:[{col:val,...},...]}
  *
- * Emits:    sql_query\n    mpack {type:"sql_query",  sql:"..."}
- *        or agent_response\n mpack {type:"agent_response", answer, query, session_id}
+ * Emits:    sql_query\n      mpack {type:"sql_query", sql:"..."}
+ *        or agent_response\n mpack {type:"agent_response", answer:"..."}
  *
- * State lives in LMDB keyed by ACTOR_CORRELATION_ID.
- * Zero dynamic allocation — all buffers are static file-scope arrays.
- * mpack for mesh I/O; cJSON for Ollama HTTP (complex nested tool JSON).
+ * Memory: LMDB keyed by ACTOR_CORRELATION_ID
+ *   Between turns: {"history":[{role,content},...]}
+ *   During ReAct:  {"history":[...], "messages":[...], "round":N}
  *
- * Env: OLLAMA_URL, OLLAMA_MODEL, EMPLOYEE_DB, ACTOR_LMDB_PATH, ACTOR_CORRELATION_ID
+ * The agent accumulates conversation history in LMDB across turns.
+ * TUI sends simple {query} payload; correlation_id in the tuple header
+ * identifies the session and keys the LMDB memory.
+ *
+ * Env: OLLAMA_URL, OLLAMA_MODEL, EMPLOYEE_DB, ACTOR_LMDB_PATH,
+ *      ACTOR_CORRELATION_ID
  * Deps: libcurl, liblmdb, libsqlite3, mpack, cJSON
  */
 
@@ -44,7 +49,6 @@ static char   g_depts[MAX_META];
 static char   g_titles[MAX_META];
 static char   g_sys[MAX_SYS];
 static char   g_query[4096];
-static char   g_session[256];
 static char   g_rows_json[MAX_ROWS_J];
 static char   g_out[MAX_OUT];
 
@@ -73,7 +77,6 @@ static MDB_env* lmdb_open(void) {
     return env;
 }
 
-/* returns pointer into g_state_buf, or NULL */
 static const char* state_load(MDB_env* env, const char* key) {
     MDB_txn* txn;
     if (mdb_txn_begin(env, NULL, 0, &txn)) return NULL;
@@ -102,17 +105,24 @@ static void state_save(MDB_env* env, const char* key, const char* val) {
     mdb_txn_commit(txn);
 }
 
-static void state_del(MDB_env* env, const char* key) {
+/* Returns 1 if this tuple_id was already seen (duplicate), 0 if fresh.
+ * Uses MDB_NOOVERWRITE so concurrent instances also dedup correctly. */
+static int dedup_check(MDB_env* env, const char* tuple_id) {
+    if (!env || !tuple_id || !*tuple_id) return 0;
     MDB_txn* txn;
-    if (mdb_txn_begin(env, NULL, 0, &txn)) return;
+    if (mdb_txn_begin(env, NULL, 0, &txn)) return 0;
     MDB_dbi dbi;
-    if (mdb_dbi_open(txn, "state", 0, &dbi)) { mdb_txn_abort(txn); return; }
-    MDB_val k = { strlen(key), (void*)key };
-    mdb_del(txn, dbi, &k, NULL);
+    if (mdb_dbi_open(txn, "dedup", MDB_CREATE, &dbi)) {
+        mdb_txn_abort(txn); return 0;
+    }
+    MDB_val k = { strlen(tuple_id), (void*)tuple_id };
+    MDB_val v = { 1, "1" };
+    int rc = mdb_put(txn, dbi, &k, &v, MDB_NOOVERWRITE);
     mdb_txn_commit(txn);
+    return rc == MDB_KEYEXIST;
 }
 
-/* ── Ollama: returns pointer to g_resp, or NULL ──────────────────────────── */
+/* ── Ollama ──────────────────────────────────────────────────────────────── */
 
 static const char* ollama_chat(const char* url, const char* model,
                                cJSON* messages, cJSON* tools) {
@@ -149,7 +159,7 @@ static const char* ollama_chat(const char* url, const char* model,
     return g_resp_len > 0 ? g_resp : NULL;
 }
 
-/* ── Schema: single DB open, results into static buffers ────────────────── */
+/* ── Schema ──────────────────────────────────────────────────────────────── */
 
 static void query_join(sqlite3* db, const char* sql, char sep,
                        char* out, size_t cap) {
@@ -188,8 +198,6 @@ static void db_meta(const char* db_path) {
         ',', g_titles, sizeof(g_titles));
     sqlite3_close(db);
 }
-
-/* ── System prompt: writes into g_sys ───────────────────────────────────── */
 
 static void make_system_prompt(const char* db_path) {
     db_meta(db_path);
@@ -249,7 +257,7 @@ static cJSON* make_tools(void) {
     return tools;
 }
 
-/* ── mpack input: decode rows array into g_rows_json ────────────────────── */
+/* ── mpack: decode sql_result rows into g_rows_json ─────────────────────── */
 
 static void decode_rows_to_json(mpack_reader_t* r) {
     size_t len = 0;
@@ -282,27 +290,23 @@ static void decode_rows_to_json(mpack_reader_t* r) {
             switch (mpack_tag_type(&tag)) {
                 case mpack_type_int:
                     snprintf(tmp, sizeof(tmp), "%lld", (long long)mpack_expect_i64(r));
-                    JA(tmp);
-                    break;
+                    JA(tmp); break;
                 case mpack_type_uint:
                     snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)mpack_expect_u64(r));
-                    JA(tmp);
-                    break;
+                    JA(tmp); break;
                 case mpack_type_float:
                     snprintf(tmp, sizeof(tmp), "%g", (double)mpack_expect_float(r));
-                    JA(tmp);
-                    break;
+                    JA(tmp); break;
                 case mpack_type_double:
                     snprintf(tmp, sizeof(tmp), "%g", mpack_expect_double(r));
-                    JA(tmp);
-                    break;
+                    JA(tmp); break;
                 case mpack_type_str: {
                     char sv[512];
                     mpack_expect_cstr(r, sv, sizeof(sv));
                     if (len + 1 < cap) g_rows_json[len++] = '"';
                     for (const char* p = sv; *p && len + 3 < cap; p++) {
                         if (*p == '"' || *p == '\\') g_rows_json[len++] = '\\';
-                        else if ((unsigned char)*p < 0x20) { len++; g_rows_json[len-1] = '?'; continue; }
+                        else if ((unsigned char)*p < 0x20) { g_rows_json[len++] = '?'; continue; }
                         g_rows_json[len++] = *p;
                     }
                     if (len + 1 < cap) g_rows_json[len++] = '"';
@@ -325,7 +329,7 @@ static void decode_rows_to_json(mpack_reader_t* r) {
 #undef JA
 }
 
-/* ── mpack emit helpers ──────────────────────────────────────────────────── */
+/* ── Output helpers ──────────────────────────────────────────────────────── */
 
 static void emit_sql_query(const char* sql) {
     mpack_writer_t w;
@@ -340,20 +344,34 @@ static void emit_sql_query(const char* sql) {
     fwrite(g_out, 1, used, stdout);
 }
 
-static void emit_agent_response(const char* answer, const char* query,
-                                const char* session_id) {
+static void emit_answer(const char* answer) {
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
-    mpack_start_map(&w, 4);
-    mpack_write_cstr(&w, "type");       mpack_write_cstr(&w, "agent_response");
-    mpack_write_cstr(&w, "answer");     mpack_write_cstr(&w, answer     ? answer     : "");
-    mpack_write_cstr(&w, "query");      mpack_write_cstr(&w, query      ? query      : "");
-    mpack_write_cstr(&w, "session_id"); mpack_write_cstr(&w, session_id ? session_id : "");
+    mpack_start_map(&w, 2);
+    mpack_write_cstr(&w, "type");   mpack_write_cstr(&w, "agent_response");
+    mpack_write_cstr(&w, "answer"); mpack_write_cstr(&w, answer ? answer : "");
     mpack_finish_map(&w);
     size_t used = mpack_writer_buffer_used(&w);
     mpack_writer_destroy(&w);
     fputs("agent_response\n", stdout);
     fwrite(g_out, 1, used, stdout);
+}
+
+/* ── Save/restore helpers ────────────────────────────────────────────────── */
+
+/* Persist {history, [messages, round]} to LMDB. Caller owns all cJSON objects. */
+static void save_state(MDB_env* env, const char* key,
+                       cJSON* history, cJSON* messages, int round) {
+    cJSON* st = cJSON_CreateObject();
+    cJSON_AddItemReferenceToObject(st, "history",  history);
+    if (messages) {
+        cJSON_AddItemReferenceToObject(st, "messages", messages);
+        cJSON_AddNumberToObject(st, "round", round);
+    }
+    char* s = cJSON_PrintUnformatted(st);
+    if (s && env) state_save(env, key, s);
+    free(s);
+    cJSON_Delete(st);
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
@@ -367,27 +385,36 @@ int main(void) {
     const char* db_path = getenv("EMPLOYEE_DB");  if (!db_path) db_path = "./employee.db";
 
     if (!corr_id || !*corr_id) {
-        emit_agent_response("internal error: no correlation id", "", "");
+        emit_answer("internal error: no correlation id");
         return 1;
+    }
+
+    MDB_env* env = lmdb_open();
+
+    /* dedup by tuple id — MDB_NOOVERWRITE is atomic, works across instances */
+    const char* tuple_id = getenv("ACTOR_TUPLE_ID");
+    if (dedup_check(env, tuple_id)) {
+        fprintf(stderr, "[llm-agent] dedup: skipping already-seen tuple %s\n", tuple_id);
+        if (env) mdb_env_close(env);
+        return 0;
     }
 
     /* decode mpack input */
     char in_type[32] = {0};
-    g_query[0] = g_session[0] = g_rows_json[0] = '\0';
+    g_query[0] = g_rows_json[0] = '\0';
 
     mpack_reader_t rdr;
     mpack_reader_init_data(&rdr, g_in, n);
 
-    static const char* in_keys[] = { "type", "query", "session_id", "rows" };
-    bool in_found[4] = { false, false, false, false };
+    static const char* in_keys[] = { "type", "query", "rows" };
+    bool in_found[3] = { false, false, false };
 
     uint32_t in_sz = mpack_expect_map_max(&rdr, 8);
     for (uint32_t i = 0; i < in_sz && mpack_reader_error(&rdr) == mpack_ok; i++) {
-        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 4)) {
+        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 3)) {
             case 0: mpack_expect_cstr(&rdr, in_type,  sizeof(in_type));  break;
             case 1: mpack_expect_cstr(&rdr, g_query,  sizeof(g_query));  break;
-            case 2: mpack_expect_cstr(&rdr, g_session, sizeof(g_session)); break;
-            case 3: decode_rows_to_json(&rdr); break;
+            case 2: decode_rows_to_json(&rdr); break;
             default: mpack_discard(&rdr); break;
         }
     }
@@ -395,49 +422,49 @@ int main(void) {
 
     if (mpack_reader_error(&rdr) != mpack_ok || !in_type[0]) {
         mpack_reader_destroy(&rdr);
-        emit_agent_response("internal error: bad mpack input", "", "");
+        emit_answer("internal error: bad mpack input");
         return 1;
     }
     mpack_reader_destroy(&rdr);
 
-    MDB_env* env    = lmdb_open();
-    cJSON*   messages = NULL;
+    cJSON*   history  = NULL;  /* cross-turn memory: [{role,content},...] */
+    cJSON*   messages = NULL;  /* ollama messages for current ReAct turn  */
     int      round    = 0;
 
+    /* load LMDB state keyed by correlation_id */
+    const char* raw = env ? state_load(env, corr_id) : NULL;
+    cJSON* stored   = raw ? cJSON_Parse(raw) : NULL;
+
     if (strcmp(in_type, "sql_result") == 0) {
-        /* Round 2+: load conversation state from LMDB */
-        const char* raw = env ? state_load(env, corr_id) : NULL;
-        if (!raw) {
+        /* ── Round 2+: continue ReAct loop ──────────────────────────────── */
+        if (!stored) {
             fprintf(stderr, "[llm-agent] no state for corr=%s, discarding\n", corr_id);
             if (env) mdb_env_close(env);
             return 0;
         }
 
-        cJSON* state = cJSON_Parse(raw);
+        round    = (int)cJSON_GetNumberValue(cJSON_GetObjectItem(stored, "round"));
+        history  = cJSON_DetachItemFromObject(stored, "history");
+        messages = cJSON_DetachItemFromObject(stored, "messages");
+        cJSON_Delete(stored);
 
-        round = (int)cJSON_GetNumberValue(cJSON_GetObjectItem(state, "round"));
-        const char* q   = cJSON_GetStringValue(cJSON_GetObjectItem(state, "query"));
-        const char* sid = cJSON_GetStringValue(cJSON_GetObjectItem(state, "session_id"));
-        snprintf(g_query,   sizeof(g_query),   "%s", q   ? q   : "");
-        snprintf(g_session, sizeof(g_session), "%s", sid ? sid : "");
-        messages = cJSON_DetachItemFromObject(state, "messages");
-        cJSON_Delete(state);
+        if (!history)  history  = cJSON_CreateArray();
+        if (!messages) { emit_answer("internal error: missing messages in state"); goto done; }
 
-        /* find last tool_call_id to correlate this result */
+        /* find last tool_call_id */
         cJSON* last_tc_id = NULL;
         int mlen = cJSON_GetArraySize(messages);
         for (int i = mlen - 1; i >= 0; i--) {
             cJSON* m   = cJSON_GetArrayItem(messages, i);
             cJSON* tcs = cJSON_GetObjectItem(m, "tool_calls");
             if (tcs && cJSON_GetArraySize(tcs) > 0) {
-                last_tc_id = cJSON_GetObjectItem(cJSON_GetArrayItem(tcs, 0), "id");
+                last_tc_id = cJSON_GetObjectItem(
+                    cJSON_GetArrayItem(tcs, 0), "id");
                 break;
             }
         }
 
-        /* append tool result message using rows JSON decoded from mpack input */
         const char* rows_str = g_rows_json[0] ? g_rows_json : "[]";
-
         cJSON* tool_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(tool_msg, "role",    "tool");
         cJSON_AddStringToObject(tool_msg, "content", rows_str);
@@ -447,31 +474,44 @@ int main(void) {
         cJSON_AddItemToArray(messages, tool_msg);
 
     } else {
-        /* Round 1: fresh conversation from user_message (g_query/g_session set by mpack decode) */
+        /* ── Round 1: new user message ───────────────────────────────────── */
         make_system_prompt(db_path);
 
-        messages = cJSON_CreateArray();
+        /* load cross-turn history */
+        if (stored) {
+            history = cJSON_DetachItemFromObject(stored, "history");
+            cJSON_Delete(stored);
+        }
+        if (!history) history = cJSON_CreateArray();
 
+        /* append this user message to history */
+        cJSON* user_entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(user_entry, "role",    "user");
+        cJSON_AddStringToObject(user_entry, "content", g_query);
+        cJSON_AddItemToArray(history, user_entry);
+
+        /* build Ollama messages: system + full history */
+        messages = cJSON_CreateArray();
         cJSON* sys_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(sys_msg, "role",    "system");
         cJSON_AddStringToObject(sys_msg, "content", g_sys);
         cJSON_AddItemToArray(messages, sys_msg);
 
-        cJSON* usr_msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(usr_msg, "role",    "user");
-        cJSON_AddStringToObject(usr_msg, "content", g_query);
-        cJSON_AddItemToArray(messages, usr_msg);
+        int hlen = cJSON_GetArraySize(history);
+        for (int i = 0; i < hlen; i++)
+            cJSON_AddItemToArray(messages,
+                cJSON_Duplicate(cJSON_GetArrayItem(history, i), 1));
     }
 
     if (round >= MAX_ROUNDS) {
-        emit_agent_response("(max rounds reached without a final answer)", g_query, g_session);
-        if (messages) cJSON_Delete(messages);
-        if (env) mdb_env_close(env);
-        return 0;
+        emit_answer("(max rounds reached without a final answer)");
+        /* still save history as-is */
+        save_state(env, corr_id, history, NULL, 0);
+        goto done;
     }
     round++;
 
-    /* round 1: offer tools; round 2+: strip system msg + no tools → force final answer */
+    /* round 1: offer tools; round 2+: no tools → force final answer */
     cJSON* msgs_to_send = messages;
     cJSON* stripped     = NULL;
     cJSON* tools        = NULL;
@@ -479,6 +519,7 @@ int main(void) {
     if (round == 1) {
         tools = make_tools();
     } else {
+        /* strip system message — model must commit to an answer now */
         stripped = cJSON_CreateArray();
         int mlen = cJSON_GetArraySize(messages);
         for (int i = 0; i < mlen; i++) {
@@ -495,55 +536,56 @@ int main(void) {
     if (tools)    cJSON_Delete(tools);
 
     if (!resp_raw) {
-        emit_agent_response("error: no response from ollama", g_query, g_session);
-        cJSON_Delete(messages);
-        if (env) mdb_env_close(env);
-        return 1;
+        emit_answer("error: no response from ollama");
+        save_state(env, corr_id, history, NULL, 0);
+        goto done;
     }
 
     cJSON* resp = cJSON_Parse(resp_raw);
     if (!resp) {
-        emit_agent_response("error: bad json from ollama", g_query, g_session);
-        cJSON_Delete(messages);
-        if (env) mdb_env_close(env);
-        return 1;
+        emit_answer("error: bad json from ollama");
+        save_state(env, corr_id, history, NULL, 0);
+        goto done;
     }
 
-    cJSON* msg        = cJSON_GetObjectItem(resp, "message");
-    cJSON* tool_calls = cJSON_GetObjectItem(msg,  "tool_calls");
-    const char* content = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "content"));
+    {
+        cJSON* msg        = cJSON_GetObjectItem(resp, "message");
+        cJSON* tool_calls = cJSON_GetObjectItem(msg,  "tool_calls");
+        const char* content = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "content"));
 
-    if (tool_calls && cJSON_GetArraySize(tool_calls) > 0) {
-        /* model wants to call a tool — save state and emit sql_query */
-        cJSON_AddItemToArray(messages, cJSON_Duplicate(msg, 1));
+        if (tool_calls && cJSON_GetArraySize(tool_calls) > 0) {
+            /* save state: history + full react messages + round, emit sql */
+            cJSON_AddItemToArray(messages, cJSON_Duplicate(msg, 1));
 
-        cJSON* tc  = cJSON_GetArrayItem(tool_calls, 0);
-        cJSON* args = cJSON_GetObjectItem(cJSON_GetObjectItem(tc, "function"), "arguments");
-        const char* sql = cJSON_GetStringValue(cJSON_GetObjectItem(args, "sql"));
+            cJSON* tc   = cJSON_GetArrayItem(tool_calls, 0);
+            cJSON* args = cJSON_GetObjectItem(
+                              cJSON_GetObjectItem(tc, "function"), "arguments");
+            const char* sql = cJSON_GetStringValue(cJSON_GetObjectItem(args, "sql"));
 
-        if (!sql || !*sql) {
-            emit_agent_response("error: model returned empty sql", g_query, g_session);
+            if (!sql || !*sql) {
+                emit_answer("error: model returned empty sql");
+                save_state(env, corr_id, history, NULL, 0);
+            } else {
+                save_state(env, corr_id, history, messages, round);
+                emit_sql_query(sql);
+            }
         } else {
-            cJSON* st = cJSON_CreateObject();
-            cJSON_AddNumberToObject(st, "round",      round);
-            cJSON_AddStringToObject(st, "query",      g_query);
-            cJSON_AddStringToObject(st, "session_id", g_session);
-            cJSON_AddItemReferenceToObject(st, "messages", messages);
-            char* st_str = cJSON_PrintUnformatted(st);
-            if (env) state_save(env, corr_id, st_str);
-            free(st_str);
-            cJSON_Delete(st);
+            /* final answer: append to history and persist memory */
+            cJSON* asst = cJSON_CreateObject();
+            cJSON_AddStringToObject(asst, "role",    "assistant");
+            cJSON_AddStringToObject(asst, "content", content ? content : "");
+            cJSON_AddItemToArray(history, asst);
 
-            emit_sql_query(sql);
+            save_state(env, corr_id, history, NULL, 0);
+            emit_answer(content);
         }
-    } else {
-        /* final answer */
-        if (env) state_del(env, corr_id);
-        emit_agent_response(content, g_query, g_session);
+
+        cJSON_Delete(resp);
     }
 
-    cJSON_Delete(resp);
-    cJSON_Delete(messages);
-    if (env) mdb_env_close(env);
+done:
+    if (messages) cJSON_Delete(messages);
+    if (history)  cJSON_Delete(history);
+    if (env)      mdb_env_close(env);
     return 0;
 }

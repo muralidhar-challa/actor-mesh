@@ -379,8 +379,12 @@ static void process_tuple(const actor_header_t* hdr,
     while (attempt <= cfg.retry_max) {
         ssize_t result_len = invoke_handler(hdr, payload, payload_len);
 
-        if (result_len >= 0) {
+        if (result_len > 0) {
             publish_result(hdr, (size_t)result_len);
+            break;
+        }
+        if (result_len == 0) {
+            /* handler produced no output — nothing to publish, treat as done */
             break;
         }
 
