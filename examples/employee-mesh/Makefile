@@ -21,7 +21,7 @@ VENDOR  = $(ROOT)/vendor
 CC           = gcc
 CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack
 LIBS         = -lzmq -llmdb
-HANDLER_LIBS = -lcurl -llmdb -lsqlite3
+HANDLER_LIBS = -lcurl -llmdb
 
 MPACK_SRCS = \
 	$(VENDOR)/mpack/src/mpack/mpack-common.c \
