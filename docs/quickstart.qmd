@@ -9,7 +9,7 @@ The employee mesh is a working ReAct agent: a natural language question arrives,
 sudo apt install libzmq3-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev
 
 # Ollama running locally with a model pulled
-ollama pull gemma3:4b
+ollama pull gemma4:e2b
 ```
 
 ## Build
@@ -37,13 +37,13 @@ This starts three processes:
 [actor]  llm-agent-1    — topic: user_message, sql_result
 ```
 
-## Query
+## Chat
 
 ```sh
-make query Q="who manages the Development department?"
-make query Q="list all engineers hired before 2020"
-make query Q="which department has the highest average salary?"
+make chat
 ```
+
+Opens the ncurses TUI. Type a question and press Enter. The agent explores the database, runs queries, and streams the answer back. Session history is preserved across turns in LMDB — follow-up questions work naturally.
 
 ## Stop
 

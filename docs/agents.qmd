@@ -26,16 +26,19 @@ sequenceDiagram
   participant AG as Agent actor
   participant TL as Tool actor
 
-  C  ->> AG : user_message {query, session_id}
-  Note over AG: build prompt, call LLM with tools
+  C  ->> AG : user_message {query}
+  Note over AG: load history from LMDB[corr_id], call LLM with tools
   AG ->> TL : sql_query {sql}
-  Note over TL: execute SQL, return rows
-  TL ->> AG : sql_result {rows}
-  Note over AG: load state from LMDB, append tool result, call LLM again
+  Note over TL: execute SQL, return rows or error
+  TL ->> AG : sql_result {rows} or {error}
+  Note over AG: append tool result, call LLM again
   AG ->> C  : agent_response {answer}
+  Note over AG: persist updated history to LMDB[corr_id]
 ```
 
-The agent actor subscribes to both `user_message` and `sql_result`. The bus does not care that the same actor receives both. The correlation ID ties two separate invocations into one logical conversation.
+The agent actor subscribes to both `user_message` and `sql_result`. The bus does not care that the same actor receives both. The `correlation_id` in the tuple header ties separate invocations into one logical conversation — and keys the LMDB memory that carries history across turns.
+
+Duplicate delivery is handled atomically: the handler writes `ACTOR_TUPLE_ID` into a `dedup` LMDB database with `MDB_NOOVERWRITE`. If the key already exists the handler exits silently with no output, and the runtime publishes nothing.
 
 ::: {.callout}
 **The loop has no fixed depth.** An agent can emit `sql_query`, receive `sql_result`, emit another `sql_query`, and so on up to whatever bound the handler enforces. The runtime is oblivious — it just delivers tuples.

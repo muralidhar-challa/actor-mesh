@@ -4,7 +4,7 @@ An actor mesh is three ideas held together tightly: a **message bus** that nobod
 
 ```{=html}
 <div class="stat-row">
-  <div class="stat"><div class="stat-num">430</div><div class="stat-lbl">LOC — runtime</div></div>
+  <div class="stat"><div class="stat-num">506</div><div class="stat-lbl">LOC — runtime</div></div>
   <div class="stat"><div class="stat-num">74</div><div class="stat-lbl">LOC — proxy</div></div>
   <div class="stat"><div class="stat-num">256 B</div><div class="stat-lbl">Fixed header</div></div>
   <div class="stat"><div class="stat-num">1 MB</div><div class="stat-lbl">Max payload</div></div>
@@ -12,7 +12,7 @@ An actor mesh is three ideas held together tightly: a **message bus** that nobod
 </div>
 ```
 
-The runtime is ~430 lines of C. The proxy is 74 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
+The runtime is ~506 lines of C. The proxy is 74 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
 
 ```
 SQL Tool   →  actor + handlers/sqlite-tool   subscribes to: sql_query
