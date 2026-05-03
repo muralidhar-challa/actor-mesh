@@ -400,21 +400,23 @@ int main(void) {
     }
 
     /* decode mpack input */
-    char in_type[32] = {0};
+    char in_type[32]  = {0};
+    char in_error[256] = {0};
     g_query[0] = g_rows_json[0] = '\0';
 
     mpack_reader_t rdr;
     mpack_reader_init_data(&rdr, g_in, n);
 
-    static const char* in_keys[] = { "type", "query", "rows" };
-    bool in_found[3] = { false, false, false };
+    static const char* in_keys[] = { "type", "query", "rows", "error" };
+    bool in_found[4] = { false, false, false, false };
 
     uint32_t in_sz = mpack_expect_map_max(&rdr, 8);
     for (uint32_t i = 0; i < in_sz && mpack_reader_error(&rdr) == mpack_ok; i++) {
-        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 3)) {
-            case 0: mpack_expect_cstr(&rdr, in_type,  sizeof(in_type));  break;
-            case 1: mpack_expect_cstr(&rdr, g_query,  sizeof(g_query));  break;
+        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 4)) {
+            case 0: mpack_expect_cstr(&rdr, in_type,   sizeof(in_type));   break;
+            case 1: mpack_expect_cstr(&rdr, g_query,   sizeof(g_query));   break;
             case 2: decode_rows_to_json(&rdr); break;
+            case 3: mpack_expect_cstr(&rdr, in_error,  sizeof(in_error));  break;
             default: mpack_discard(&rdr); break;
         }
     }
@@ -464,7 +466,10 @@ int main(void) {
             }
         }
 
-        const char* rows_str = g_rows_json[0] ? g_rows_json : "[]";
+        /* if sqlite-tool returned an error, feed that back so the model can retry */
+        const char* rows_str = in_error[0]
+            ? in_error
+            : (g_rows_json[0] ? g_rows_json : "[]");
         cJSON* tool_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(tool_msg, "role",    "tool");
         cJSON_AddStringToObject(tool_msg, "content", rows_str);
@@ -511,15 +516,18 @@ int main(void) {
     }
     round++;
 
-    /* round 1: offer tools; round 2+: no tools → force final answer */
+    /* keep tools available while we have successful results to build on;
+     * on a sql error the model needs tools to retry with corrected SQL;
+     * only force final answer (strip tools+system) after a successful result */
+    bool sql_errored = (in_error[0] != '\0');
     cJSON* msgs_to_send = messages;
     cJSON* stripped     = NULL;
     cJSON* tools        = NULL;
 
-    if (round == 1) {
+    if (round == 1 || sql_errored) {
         tools = make_tools();
     } else {
-        /* strip system message — model must commit to an answer now */
+        /* successful sql result received — strip system, no tools, force answer */
         stripped = cJSON_CreateArray();
         int mlen = cJSON_GetArraySize(messages);
         for (int i = 0; i < mlen; i++) {

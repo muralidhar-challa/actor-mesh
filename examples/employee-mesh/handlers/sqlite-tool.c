@@ -57,7 +57,7 @@ int main(void) {
     mpack_done_map(&r);
     mpack_reader_destroy(&r);
 
-    if (!sql_val[0]) { emit_error("missing sql field"); return 1; }
+    if (!sql_val[0]) { emit_error("missing sql field"); return 0; }
 
     /* strip trailing whitespace and semicolons the LLM often appends */
     {
@@ -72,8 +72,9 @@ int main(void) {
 
     sqlite3* db;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        emit_error("db open failed");
-        return 1;
+        emit_error(sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 0;
     }
 
     /* wrap in LIMIT cap so the tool can never return unbounded rows */
@@ -81,17 +82,23 @@ int main(void) {
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, g_capped, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "[sqlite-tool] prepare failed: %s\n", sqlite3_errmsg(db));
+        emit_error(sqlite3_errmsg(db));
         sqlite3_close(db);
-        emit_error("sql prepare failed");
-        return 1;
+        return 0;
     }
 
     int ncols = sqlite3_column_count(stmt);
 
     /* pass 1: count rows */
     int nrows = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) nrows++;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) nrows++;
+    if (step_rc != SQLITE_DONE) {
+        emit_error(sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return 0;
+    }
     sqlite3_reset(stmt);
 
     /* pass 2: write mpack output */
