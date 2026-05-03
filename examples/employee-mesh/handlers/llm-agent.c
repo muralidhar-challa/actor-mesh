@@ -35,7 +35,7 @@
 #define MAX_SYS     (128 * 1024)
 #define MAX_ROWS_J  (128 * 1024)
 #define MAX_OUT     (1   * 1024 * 1024)
-#define MAX_ROUNDS  6
+#define MAX_ROUNDS  10
 
 static char   g_in[MAX_IN];
 static char   g_resp[MAX_RESP];
@@ -157,10 +157,12 @@ static const char* ollama_chat(const char* url, const char* model,
 
 static void make_system_prompt(void) {
     snprintf(g_sys, sizeof(g_sys),
-        "You are a data analyst. When given a question, explore the database "
-        "using query_db — inspect the schema, run queries, follow the data — "
-        "and deliver a clear, evidence-based answer. "
-        "Think like an analyst: if the first query raises more questions, keep going.");
+        "You are a data analyst. You have access to a SQLite database via the query_db tool.\n"
+        "ALWAYS call query_db — never answer from memory. "
+        "Start by exploring the schema if needed (e.g. SELECT name FROM sqlite_master WHERE type='table'), "
+        "then run whatever queries the question requires. "
+        "Follow the data: if one query raises more questions, run another. "
+        "Deliver a clear, evidence-based answer once you have enough data.");
 }
 
 /* ── Tool definition ─────────────────────────────────────────────────────── */
@@ -455,19 +457,19 @@ int main(void) {
     /* keep tools available while we have successful results to build on;
      * on a sql error the model needs tools to retry with corrected SQL;
      * only force final answer (strip tools+system) after a successful result */
-    bool sql_errored = (in_error[0] != '\0');
+    /* keep tools available so the model can keep querying across rounds;
+     * on the final round strip tools + system to force a text answer */
     cJSON* msgs_to_send = messages;
     cJSON* stripped     = NULL;
     cJSON* tools        = NULL;
 
-    if (round == 1 || sql_errored) {
+    if (round < MAX_ROUNDS) {
         tools = make_tools();
     } else {
-        /* successful sql result received — strip system, no tools, force answer */
         stripped = cJSON_CreateArray();
         int mlen = cJSON_GetArraySize(messages);
         for (int i = 0; i < mlen; i++) {
-            cJSON* m    = cJSON_GetArrayItem(messages, i);
+            cJSON* m = cJSON_GetArrayItem(messages, i);
             const char* role = cJSON_GetStringValue(cJSON_GetObjectItem(m, "role"));
             if (role && strcmp(role, "system") != 0)
                 cJSON_AddItemToArray(stripped, cJSON_Duplicate(m, 1));

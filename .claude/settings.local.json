@@ -56,7 +56,8 @@
       "Bash(make tui *)",
       "Bash(make query *)",
       "Bash(timeout 30 /tmp/test_query)",
-      "Bash(fossil extras *)"
+      "Bash(fossil extras *)",
+      "Bash(timeout 120 /tmp/test_followup)"
     ]
   }
 }
