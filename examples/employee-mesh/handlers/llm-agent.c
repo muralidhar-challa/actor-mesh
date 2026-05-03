@@ -157,9 +157,10 @@ static const char* ollama_chat(const char* url, const char* model,
 
 static void make_system_prompt(void) {
     snprintf(g_sys, sizeof(g_sys),
-        "You are a helpful assistant with access to a SQLite database. "
-        "Use the query_db tool to answer questions. "
-        "You can run any read query including schema exploration.");
+        "You are a data analyst. When given a question, explore the database "
+        "using query_db — inspect the schema, run queries, follow the data — "
+        "and deliver a clear, evidence-based answer. "
+        "Think like an analyst: if the first query raises more questions, keep going.");
 }
 
 /* ── Tool definition ─────────────────────────────────────────────────────── */
