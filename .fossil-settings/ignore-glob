@@ -2,7 +2,9 @@
 actor
 zmq-proxy
 examples/employee-mesh/client
+examples/employee-mesh/tui
 examples/employee-mesh/handlers/llm-agent
 examples/employee-mesh/handlers/sqlite-tool
+models/distilbert-ner/model.onnx
 /tmp/
 docs/_book/*

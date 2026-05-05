@@ -286,12 +286,12 @@ static void emit_answer(const char* answer) {
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
     mpack_start_map(&w, 2);
-    mpack_write_cstr(&w, "type");   mpack_write_cstr(&w, "agent_response");
+    mpack_write_cstr(&w, "type");   mpack_write_cstr(&w, "agent_response_masked");
     mpack_write_cstr(&w, "answer"); mpack_write_cstr(&w, answer ? answer : "");
     mpack_finish_map(&w);
     size_t used = mpack_writer_buffer_used(&w);
     mpack_writer_destroy(&w);
-    fputs("agent_response\n", stdout);
+    fputs("agent_response_masked\n", stdout);
     fwrite(g_out, 1, used, stdout);
 }
 
@@ -375,7 +375,7 @@ int main(void) {
     const char* raw = env ? state_load(env, corr_id) : NULL;
     cJSON* stored   = raw ? cJSON_Parse(raw) : NULL;
 
-    if (strcmp(in_type, "sql_result") == 0) {
+    if (strcmp(in_type, "sql_result_masked") == 0) {
         /* ── Round 2+: continue ReAct loop ──────────────────────────────── */
         if (!stored) {
             fprintf(stderr, "[llm-agent] no state for corr=%s, discarding\n", corr_id);

@@ -61,8 +61,9 @@ clean:
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
-LMDB_BASE   ?= /tmp/actor-mesh
-EMPLOYEE_DB ?= $(abspath db/employee.db)
+LMDB_BASE    ?= /tmp/actor-mesh
+TOKENMAP_PATH ?= $(LMDB_BASE)/tokenmap
+EMPLOYEE_DB  ?= $(abspath db/employee.db)
 
 # ── Bus ────────────────────────────────────────────────────────────────────
 
@@ -87,10 +88,10 @@ COMMON_ENV = \
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent query chat
+.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent run-tokenise run-detokenise query chat
 
-run: run-proxy run-sqlite-tool run-llm-agent
-	@echo "[mesh] employee mesh running"
+run: run-proxy run-tokenise run-detokenise run-sqlite-tool run-llm-agent
+	@echo "[mesh] employee mesh running (PII tokenisation enabled)"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
@@ -125,8 +126,8 @@ run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=user_message,sql_result \
-	ACTOR_RESULT_TOPIC=agent_response \
+	ACTOR_TOPIC=user_message_masked,sql_result_masked \
+	ACTOR_RESULT_TOPIC=agent_response_masked \
 	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 	OLLAMA_URL=$(OLLAMA_URL) \
@@ -134,6 +135,30 @@ run-llm-agent:
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
 	$(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
 	@echo "[actor] llm-agent started  (log: $(LOGDIR)/llm-agent.log)"
+
+run-tokenise:
+	@mkdir -p $(LMDB_BASE)/tokenise $(LOGDIR)
+	@$(COMMON_ENV) \
+	ACTOR_ID=tokenise-1 \
+	ACTOR_TOPIC=user_message,sql_result \
+	ACTOR_RESULT_TOPIC=user_message_masked \
+	ACTOR_HANDLER="python3 $(abspath handlers/tokenise.py)" \
+	ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
+	TOKENMAP_PATH=$(TOKENMAP_PATH) \
+	$(ACTOR) >>$(LOGDIR)/tokenise.log 2>&1 &
+	@echo "[actor] tokenise started  (log: $(LOGDIR)/tokenise.log)"
+
+run-detokenise:
+	@mkdir -p $(LMDB_BASE)/detokenise $(LOGDIR)
+	@$(COMMON_ENV) \
+	ACTOR_ID=detokenise-1 \
+	ACTOR_TOPIC=agent_response_masked \
+	ACTOR_RESULT_TOPIC=agent_response \
+	ACTOR_HANDLER="python3 $(abspath handlers/detokenise.py)" \
+	ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
+	TOKENMAP_PATH=$(TOKENMAP_PATH) \
+	$(ACTOR) >>$(LOGDIR)/detokenise.log 2>&1 &
+	@echo "[actor] detokenise started  (log: $(LOGDIR)/detokenise.log)"
 
 # ── Query / Chat ───────────────────────────────────────────────────────────
 

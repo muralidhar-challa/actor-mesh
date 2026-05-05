@@ -60,7 +60,18 @@
       "Bash(timeout 120 /tmp/test_followup)",
       "Bash(timeout 600 /tmp/test_hardened)",
       "Bash(sqlite3 /home/max/Projects/mesh-actors/examples/employee-mesh/db/employee.db ' *)",
-      "Bash(time sqlite3 *)"
+      "Bash(time sqlite3 *)",
+      "Bash(quarto --version)",
+      "Bash(pkg-config --modversion libzmq)",
+      "Bash(gcc -x c - -lzmq -o /dev/null)",
+      "Bash(python3 -c \"import spacy; print\\(spacy.__version__\\)\")",
+      "Bash(pkg-config --libs onnxruntime)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"import spacy; nlp = spacy.load\\('en_core_web_sm'\\); print\\('loaded ok, pipeline:', nlp.pipe_names\\)\")",
+      "Bash(python3 tools/export_ner_onnx.py)",
+      "Bash(python3 tools/export_ner_onnx.py --smoke-test)",
+      "Bash(./client \"list all engineers\")"
     ]
   }
 }
