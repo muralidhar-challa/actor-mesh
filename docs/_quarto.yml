@@ -18,6 +18,7 @@ book:
     - composition.qmd
     - agents.qmd
     - reference.qmd
+    - appendix.qmd
 
 format:
   html:

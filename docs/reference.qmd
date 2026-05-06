@@ -33,22 +33,5 @@ make ACTOR_MAX_PAYLOAD=4194304
 | Observable | Every tuple is a published event. Subscribe to `heartbeat` to see the mesh. Subscribe to `*` to see everything. |
 | Composable | Adding an actor to a running mesh requires zero changes to existing actors. Subscribe to a topic, emit on a topic, done. |
 
-## Lineage
-
-This design independently converges on ideas that have proven themselves over decades:
-
-| Lineage | Connection |
-|---|---|
-| **Erlang/OTP (1986)** | Actor model, let it crash, message passing |
-| **Unix pipes (1969)** | stdio as the universal process interface |
-| **Linda tuplespace (1986)** | Decoupled coordination via shared space |
-| **Plan 9** | Everything is a file; communicate via read/write |
-
-The difference: C native, zero framework, same binary from edge to cloud.
-
 ---
 
-> The runtime does not know what a message means.
-> The handler does not know where the message came from.
-> The bus does not know who is subscribed.
-> This is the design.
