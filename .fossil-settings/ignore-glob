@@ -8,3 +8,4 @@ examples/employee-mesh/handlers/sqlite-tool
 models/distilbert-ner/model.onnx
 /tmp/
 docs/_book/*
+examples/employee-mesh/handlers/pii-filter
