@@ -1,47 +1,91 @@
 # Quick Start
 
-The employee mesh is a working ReAct agent: a natural language question arrives, the agent generates SQL, the SQL tool executes it against SQLite, the result comes back, the agent answers. Two actors. One bus. No framework.
+The employee mesh is a working ReAct agent: a natural language question arrives, the agent generates SQL, the SQL tool executes it against SQLite, the result comes back, the agent answers. Five actors. One bus. Full PII tokenisation.
 
 ## Prerequisites
 
 ```sh
-# system deps (Debian/Ubuntu)
-sudo apt install libzmq3-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev
+# Debian/Ubuntu
+sudo apt install libzmq3-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev libncursesw5-dev
 
-# Ollama running locally with a model pulled
+# Fedora/RHEL
+sudo dnf install zeromq-devel lmdb-devel libcurl-devel sqlite-devel ncurses-devel
+```
+
+Ollama running locally with a model:
+
+```sh
 ollama pull gemma4:e2b
+```
+
+ONNX Runtime (for PII NER filtering):
+
+```sh
+# Fedora
+sudo dnf install onnxruntime-devel
+
+# Or build from source: https://github.com/microsoft/onnxruntime
+```
+
+Python (for build tools only — the mesh itself is pure C):
+
+```sh
+pip install msgpack  # needed by export scripts
 ```
 
 ## Build
 
 ```sh
-# build the runtime first
+# 1. Build the runtime (actor + proxy)
 make
 
-# build the employee-mesh demo
+# 2. Build the employee-mesh demo (client, TUI, handlers)
 cd examples/employee-mesh
-make
+make all
+```
+
+This produces:
+
+```
+actor                  — runtime binary
+zmq-proxy              — bus proxy (74 lines)
+examples/employee-mesh/
+  client               — CLI query tool
+  tui                  — ncurses chat interface
+  handlers/
+    llm-agent          — ReAct agent (Ollama + LMDB)
+    sqlite-tool        — SQLite query executor
+    pii-filter         — NER mask/restore (ONNX)
 ```
 
 ## Run
 
 ```sh
+cd examples/employee-mesh
 make run
 ```
 
-This starts two processes (no PII filtering). Or run `make run` to start the full mesh with PII tokenisation — 5 processes:
+This starts 5 processes:
 
-```
-[proxy]   zmq-proxy    — XSUB:5557  XPUB:5556
-[actor]   tokenise-1   — topic: user_message, sql_result
-[actor]   detokenise-1 — topic: sql_query_masked, agent_response_masked
-[actor]   sqlite-tool-1 — topic: sql_query
-[actor]   llm-agent-1  — topic: user_message_masked, sql_result_masked
+| Process | Topic subscription | Role |
+|---------|-------------------|------|
+| `zmq-proxy` | — | Bus fanout (:5556/:5557) |
+| `tokenise-1` | `user_message`, `sql_result` | Mask PII before LLM |
+| `detokenise-1` | `sql_query_masked`, `agent_response_masked` | Restore PII after LLM |
+| `sqlite-tool-1` | `sql_query` | Execute SQL |
+| `llm-agent-1` | `user_message_masked`, `sql_result_masked` | ReAct agent (Ollama) |
+
+## Query
+
+```sh
+make query Q="who manages the Development department?"
 ```
 
-::: {.callout-note}
-The full `make run` enables PII tokenisation by default. Everything the LLM sees is tokenised; everything it emits is detokenised. See @agents for the PII Token Bubble design.
-:::
+Or use the client directly:
+
+```sh
+./client "how many employees in Development?"
+```
 
 ## Chat
 
@@ -49,7 +93,7 @@ The full `make run` enables PII tokenisation by default. Everything the LLM sees
 make chat
 ```
 
-Opens the ncurses TUI. Type a question and press Enter. The agent explores the database, runs queries, and streams the answer back. Session history is preserved across turns in LMDB — follow-up questions work naturally.
+Opens the ncurses TUI. Type a question and press Enter. The agent explores the database, runs queries, and answers. Session history persists across turns in LMDB.
 
 ## Stop
 
@@ -57,9 +101,9 @@ Opens the ncurses TUI. Type a question and press Enter. The agent explores the d
 make stop
 ```
 
-Kills all mesh processes and wipes the LMDB state directories.
+Kills all mesh processes and wipes LMDB state.
 
-## What just ran
+## Pipeline
 
 ```{mermaid}
 sequenceDiagram
@@ -69,11 +113,11 @@ sequenceDiagram
   participant DK as detokenise
   participant DB as sqlite-tool
 
-  C  ->> TK : user_message {query}
-  Note over TK: mask PII entities
+  C  ->> TK : user_message
+  Note over TK: mask PII → tokens
   TK ->> AG : user_message_masked
   AG ->> DK : sql_query_masked
-  Note over DK: restore real names
+  Note over DK: restore names in SQL
   DK ->> DB : sql_query
   DB ->> TK : sql_result
   Note over TK: mask employee data
@@ -81,16 +125,32 @@ sequenceDiagram
   AG ->> DK : agent_response_masked
   Note over DK: restore answer
   DK ->> C  : agent_response
-  BUS ->> AG : user_message
-  Note over AG: call LLM, get SQL tool call
-  AG ->> BUS : sql_query {sql}
-  BUS ->> ST : sql_query
-  Note over ST: execute against employee.db
-  ST ->> BUS : sql_result {rows}
-  BUS ->> AG : sql_result
-  Note over AG: load LMDB state, call LLM with rows
-  AG ->> BUS : agent_response {answer}
-  BUS ->> C  : agent_response
 ```
 
-The `llm-agent` subscribes to **two** topics — `user_message` and `sql_result` — and uses `ACTOR_CORRELATION_ID` to stitch both invocations into a single conversation turn stored in LMDB.
+The LLM never sees real PII. Everything entering its context is tokenised (`TOK_PERSON_0001`). Everything it emits is detokenised before reaching the user or database. See @agents for the full PII Token Bubble design.
+
+## Configuration
+
+All behaviour is controlled by environment variables. See @appendix for the complete reference. The key ones:
+
+```sh
+# LLM backend
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=gemma4:e2b
+
+# PII filtering
+NER_MODEL_PATH=models/ner.onnx
+TOKENMAP_PATH=/tmp/actor-mesh/tokenmap
+```
+
+## Troubleshooting
+
+**"No such file: handlers/pii-filter"** — run `make all` to build all handlers.
+
+**"mdb_env_open: No such file or directory"** — the tokenmap directory wasn't created. `make run` should create it; if running actors manually, ensure `TOKENMAP_PATH` exists.
+
+**Client times out** — the ReAct loop can take 30-90 seconds with local Ollama. The client has a 10-minute timeout. Check Ollama is running: `curl http://localhost:11434/api/tags`.
+
+**Port already in use** — `make stop` or `pkill zmq-proxy` to free ports 5556/5557.
+
+**Tokens not restoring** — the client must use the null-terminator fix for ZMQ subscriptions. Current code includes this; older builds may not.
