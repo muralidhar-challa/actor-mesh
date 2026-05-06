@@ -22,7 +22,7 @@ CC           = gcc
 CXX          = g++
 CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack -I$(ROOT)
 LIBS         = -lzmq -llmdb
-HANDLER_LIBS = -lcurl -llmdb
+HANDLER_LIBS = -lcurl -llmdb -lsqlite3
 
 NER_MODEL    ?= $(abspath ../../models/ner.onnx)
 NER_INCS     = -I$(ROOT)/vendor/smhasher -I$(ROOT) -I/usr/include/onnxruntime
@@ -113,7 +113,7 @@ stop:
 LOGDIR ?= /tmp/actor-mesh/logs
 
 run-proxy:
-	@mkdir -p $(LMDB_BASE) $(LOGDIR)
+	@mkdir -p $(LMDB_BASE) $(LOGDIR) $(TOKENMAP_PATH)
 	@PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
 	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
 	$(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
@@ -136,7 +136,7 @@ run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=user_message_masked,sql_result_masked \
+	ACTOR_TOPIC=user_message,sql_result_masked \
 	ACTOR_RESULT_TOPIC=agent_response_masked \
 	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
@@ -150,7 +150,7 @@ run-tokenise:
 	@mkdir -p $(LMDB_BASE)/tokenise $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=tokenise-1 \
-	ACTOR_TOPIC=user_message,sql_result \
+	ACTOR_TOPIC=sql_result \
 	ACTOR_RESULT_TOPIC=user_message_masked \
 	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \

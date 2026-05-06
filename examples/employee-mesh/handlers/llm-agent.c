@@ -6,7 +6,7 @@
  *           mpack sql_result    {type, rows:[{col:val,...},...]}
  *
  * Emits:    sql_query\n      mpack {type:"sql_query", sql:"..."}
- *        or agent_response\n mpack {type:"agent_response", answer:"..."}
+ *        or agent_response\n mpack {type:"agent_response_masked", answer:"..."}
  *
  * Memory: LMDB keyed by ACTOR_CORRELATION_ID
  *   Between turns: {"history":[{role,content},...]}
@@ -25,6 +25,7 @@
 #include "mpack.h"
 #include <curl/curl.h>
 #include <lmdb.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,15 +33,20 @@
 #define MAX_IN      (256 * 1024)
 #define MAX_RESP    (2   * 1024 * 1024)
 #define MAX_STATE   (512 * 1024)
+#define MAX_SCHEMA  (64  * 1024)
+#define MAX_META    (8   * 1024)
 #define MAX_SYS     (128 * 1024)
 #define MAX_ROWS_J  (128 * 1024)
 #define MAX_OUT     (1   * 1024 * 1024)
-#define MAX_ROUNDS  10
+#define MAX_ROUNDS  6
 
 static char   g_in[MAX_IN];
 static char   g_resp[MAX_RESP];
 static size_t g_resp_len;
 static char   g_state_buf[MAX_STATE];
+static char   g_schema[MAX_SCHEMA];
+static char   g_depts[MAX_META];
+static char   g_titles[MAX_META];
 static char   g_sys[MAX_SYS];
 static char   g_query[4096];
 static char   g_rows_json[MAX_ROWS_J];
@@ -155,14 +161,70 @@ static const char* ollama_chat(const char* url, const char* model,
 
 /* ── Schema ──────────────────────────────────────────────────────────────── */
 
-static void make_system_prompt(void) {
-    snprintf(g_sys, sizeof(g_sys),
-        "You are a data analyst. You have access to a SQLite database via the query_db tool.\n"
-        "ALWAYS call query_db — never answer from memory. "
-        "Start by exploring the schema if needed (e.g. SELECT name FROM sqlite_master WHERE type='table'), "
-        "then run whatever queries the question requires. "
-        "Follow the data: if one query raises more questions, run another. "
-        "Deliver a clear, evidence-based answer once you have enough data.");
+static void query_join(sqlite3* db, const char* sql, char sep,
+                       char* out, size_t cap) {
+    size_t len = 0;
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char* v = (const char*)sqlite3_column_text(stmt, 0);
+            if (!v) continue;
+            size_t vlen = strlen(v);
+            if (len + vlen + 3 >= cap) break;
+            memcpy(out + len, v, vlen);
+            len += vlen;
+            out[len++] = sep;
+            if (sep == ',') out[len++] = ' ';
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (len > 0 && out[len-1] == ' ' && len > 1) len -= 2;
+    else if (len > 0 && out[len-1] == sep) len--;
+    out[len] = '\0';
+}
+
+static void db_meta(const char* db_path) {
+    sqlite3* db;
+    g_schema[0] = g_depts[0] = g_titles[0] = '\0';
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) return;
+    query_join(db,
+        "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name",
+        '\n', g_schema, sizeof(g_schema));
+    query_join(db,
+        "SELECT dept_name FROM departments ORDER BY dept_name",
+        ',', g_depts, sizeof(g_depts));
+    query_join(db,
+        "SELECT DISTINCT title FROM titles ORDER BY title",
+        ',', g_titles, sizeof(g_titles));
+    sqlite3_close(db);
+}
+
+static void make_system_prompt(const char* db_path) {
+    db_meta(db_path);
+    size_t len = 0;
+
+#define APPEND(s) do { \
+    size_t _l = strlen(s); \
+    if (len + _l + 1 < sizeof(g_sys)) { memcpy(g_sys + len, s, _l); len += _l; } \
+} while(0)
+
+    APPEND("You are an HR assistant. You MUST call query_db for every question. Never answer from memory.\n\n");
+    APPEND("Schema:\n"); APPEND(g_schema); APPEND("\n\n");
+    APPEND("Exact department names: "); APPEND(g_depts); APPEND("\n");
+    APPEND("Exact job titles: ");       APPEND(g_titles); APPEND("\n\n");
+    APPEND("Rules:\n");
+    APPEND("- dept_no is a short code (d001 etc). Always JOIN departments to filter by dept_name.\n");
+    APPEND("- Always use LIKE for name matching (never exact =)\n");
+    APPEND("- Use to_date='9999-01-01' to get current records only\n");
+    APPEND("- Always LIMIT 20\n");
+    APPEND("- There is NO 'Engineering' department — use 'Development'\n\n");
+    APPEND("Examples:\n");
+    APPEND("-- manager: SELECT e.first_name,e.last_name,d.dept_name FROM employees e JOIN dept_manager dm ON e.emp_no=dm.emp_no JOIN departments d ON dm.dept_no=d.dept_no WHERE d.dept_name LIKE '%Development%' AND dm.to_date='9999-01-01' LIMIT 20\n");
+    APPEND("-- title:   SELECT e.first_name,e.last_name,t.title FROM employees e JOIN titles t ON e.emp_no=t.emp_no WHERE t.title LIKE '%Engineer%' AND t.to_date='9999-01-01' LIMIT 20\n");
+    APPEND("-- salary:  SELECT e.first_name,e.last_name,s.salary FROM employees e JOIN salaries s ON e.emp_no=s.emp_no WHERE s.to_date='9999-01-01' ORDER BY s.salary DESC LIMIT 20\n");
+
+#undef APPEND
+    g_sys[len] = '\0';
 }
 
 /* ── Tool definition ─────────────────────────────────────────────────────── */
@@ -338,23 +400,21 @@ int main(void) {
     }
 
     /* decode mpack input */
-    char in_type[32]  = {0};
-    char in_error[256] = {0};
+    char in_type[32] = {0};
     g_query[0] = g_rows_json[0] = '\0';
 
     mpack_reader_t rdr;
     mpack_reader_init_data(&rdr, g_in, n);
 
-    static const char* in_keys[] = { "type", "query", "rows", "error" };
-    bool in_found[4] = { false, false, false, false };
+    static const char* in_keys[] = { "type", "query", "rows" };
+    bool in_found[3] = { false, false, false };
 
     uint32_t in_sz = mpack_expect_map_max(&rdr, 8);
     for (uint32_t i = 0; i < in_sz && mpack_reader_error(&rdr) == mpack_ok; i++) {
-        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 4)) {
-            case 0: mpack_expect_cstr(&rdr, in_type,   sizeof(in_type));   break;
-            case 1: mpack_expect_cstr(&rdr, g_query,   sizeof(g_query));   break;
+        switch (mpack_expect_key_cstr(&rdr, in_keys, in_found, 3)) {
+            case 0: mpack_expect_cstr(&rdr, in_type,  sizeof(in_type));  break;
+            case 1: mpack_expect_cstr(&rdr, g_query,  sizeof(g_query));  break;
             case 2: decode_rows_to_json(&rdr); break;
-            case 3: mpack_expect_cstr(&rdr, in_error,  sizeof(in_error));  break;
             default: mpack_discard(&rdr); break;
         }
     }
@@ -375,7 +435,7 @@ int main(void) {
     const char* raw = env ? state_load(env, corr_id) : NULL;
     cJSON* stored   = raw ? cJSON_Parse(raw) : NULL;
 
-    if (strcmp(in_type, "sql_result_masked") == 0) {
+    if (strcmp(in_type, "sql_result_masked") == 0 || strcmp(in_type, "sql_result") == 0) {
         /* ── Round 2+: continue ReAct loop ──────────────────────────────── */
         if (!stored) {
             fprintf(stderr, "[llm-agent] no state for corr=%s, discarding\n", corr_id);
@@ -404,10 +464,7 @@ int main(void) {
             }
         }
 
-        /* if sqlite-tool returned an error, feed that back so the model can retry */
-        const char* rows_str = in_error[0]
-            ? in_error
-            : (g_rows_json[0] ? g_rows_json : "[]");
+        const char* rows_str = g_rows_json[0] ? g_rows_json : "[]";
         cJSON* tool_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(tool_msg, "role",    "tool");
         cJSON_AddStringToObject(tool_msg, "content", rows_str);
@@ -418,7 +475,7 @@ int main(void) {
 
     } else {
         /* ── Round 1: new user message ───────────────────────────────────── */
-        make_system_prompt();
+        make_system_prompt(db_path);
 
         /* load cross-turn history */
         if (stored) {
@@ -454,22 +511,19 @@ int main(void) {
     }
     round++;
 
-    /* keep tools available while we have successful results to build on;
-     * on a sql error the model needs tools to retry with corrected SQL;
-     * only force final answer (strip tools+system) after a successful result */
-    /* keep tools available so the model can keep querying across rounds;
-     * on the final round strip tools + system to force a text answer */
+    /* round 1: offer tools; round 2+: no tools → force final answer */
     cJSON* msgs_to_send = messages;
     cJSON* stripped     = NULL;
     cJSON* tools        = NULL;
 
-    if (round < MAX_ROUNDS) {
+    if (round == 1) {
         tools = make_tools();
     } else {
+        /* strip system message — model must commit to an answer now */
         stripped = cJSON_CreateArray();
         int mlen = cJSON_GetArraySize(messages);
         for (int i = 0; i < mlen; i++) {
-            cJSON* m = cJSON_GetArrayItem(messages, i);
+            cJSON* m    = cJSON_GetArrayItem(messages, i);
             const char* role = cJSON_GetStringValue(cJSON_GetObjectItem(m, "role"));
             if (role && strcmp(role, "system") != 0)
                 cJSON_AddItemToArray(stripped, cJSON_Duplicate(m, 1));

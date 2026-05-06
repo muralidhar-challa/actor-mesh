@@ -220,6 +220,7 @@ static inline NerModel *ner_model_load(const char *model_path)
     ORT_CHECK(m->api, m->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ner", &m->env));
     ORT_CHECK(m->api, m->api->CreateSessionOptions(&m->opts));
     ORT_CHECK(m->api, m->api->SetIntraOpNumThreads(m->opts, 1));
+    ORT_CHECK(m->api, m->api->SetInterOpNumThreads(m->opts, 1));
     /* ORT_ENABLE_EXTENDED triggers GatherSliceToSplitFusion, which tries to
      * rename fused Gather nodes but produces a collision when the exported
      * graph has no explicit node names (all name="").  BASIC covers constant

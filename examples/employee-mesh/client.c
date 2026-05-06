@@ -2,7 +2,7 @@
  *
  * Usage: ./client "list all engineers"
  *
- * Uses a unique session_id per invocation to skip stale responses.
+ * Matches responses by correlation_id in the header (same as TUI).
  * Mesh wire format: mpack (MessagePack).
  */
 
@@ -19,13 +19,13 @@
 
 #define BUS_PUB      "tcp://localhost:5557"
 #define BUS_SUB      "tcp://localhost:5556"
-#define TIMEOUT_MS   120000
+#define TIMEOUT_MS   600000
 #define MAX_OUT      4096
 #define MAX_ANSWER   (256 * 1024)
 
 static char g_out[MAX_OUT];
 static char g_answer[MAX_ANSWER];
-static char g_resp_session[64];
+static uint8_t g_corr_id[16];
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -33,18 +33,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    char session_id[32];
-    snprintf(session_id, sizeof(session_id), "cli-%ld", (long)time(NULL));
+    /* generate a correlation_id for this session (same approach as TUI) */
+    actor_uuid_gen(g_corr_id);
 
     const char* query = argv[1];
 
-    /* build mpack payload: {type, query, session_id} */
+    /* build mpack payload: {type, query} */
     mpack_writer_t pw;
     mpack_writer_init(&pw, g_out, sizeof(g_out));
-    mpack_start_map(&pw, 3);
-    mpack_write_cstr(&pw, "type");       mpack_write_cstr(&pw, "user_message");
-    mpack_write_cstr(&pw, "query");      mpack_write_cstr(&pw, query);
-    mpack_write_cstr(&pw, "session_id"); mpack_write_cstr(&pw, session_id);
+    mpack_start_map(&pw, 2);
+    mpack_write_cstr(&pw, "type");   mpack_write_cstr(&pw, "user_message");
+    mpack_write_cstr(&pw, "query");  mpack_write_cstr(&pw, query);
     mpack_finish_map(&pw);
     size_t plen = mpack_writer_buffer_used(&pw);
     mpack_writer_destroy(&pw);
@@ -62,7 +61,7 @@ int main(int argc, char** argv) {
     nanosleep(&ts, NULL);
 
     actor_header_t hdr;
-    actor_tuple_init(&hdr, "user_message", "client", NULL, NULL, (uint32_t)plen);
+    actor_tuple_init(&hdr, "user_message", "client", g_corr_id, NULL, (uint32_t)plen);
     actor_uuid_gen(hdr.id);
 
     zmq_send(pub, &hdr,   sizeof(actor_header_t), ZMQ_SNDMORE);
@@ -86,25 +85,38 @@ int main(int argc, char** argv) {
         if (zmq_msg_more(&hdr_msg))
             zmq_msg_recv(&pay_msg, sub, 0);
 
+        if (zmq_msg_size(&hdr_msg) < sizeof(actor_header_t)) {
+            zmq_msg_close(&hdr_msg);
+            zmq_msg_close(&pay_msg);
+            continue;
+        }
+
+        const actor_header_t* hdr_in = (const actor_header_t*)zmq_msg_data(&hdr_msg);
+
+        /* match by correlation_id (same as TUI) */
+        if (memcmp(hdr_in->correlation_id, g_corr_id, 16) != 0) {
+            zmq_msg_close(&hdr_msg);
+            zmq_msg_close(&pay_msg);
+            continue;
+        }
+
         const char* body = (const char*)zmq_msg_data(&pay_msg);
         size_t      blen = zmq_msg_size(&pay_msg);
 
-        /* decode mpack response to check session_id */
-        g_answer[0] = g_resp_session[0] = '\0';
+        /* decode mpack response */
+        g_answer[0] = '\0';
 
         mpack_reader_t r;
         mpack_reader_init_data(&r, body, blen);
 
-        static const char* rkeys[] = { "type", "answer", "query", "session_id" };
-        bool rfound[4] = { false, false, false, false };
+        static const char* rkeys[] = { "type", "answer" };
+        bool rfound[2] = { false, false };
 
         uint32_t rsz = mpack_expect_map_max(&r, 8);
         for (uint32_t i = 0; i < rsz && mpack_reader_error(&r) == mpack_ok; i++) {
-            switch (mpack_expect_key_cstr(&r, rkeys, rfound, 4)) {
+            switch (mpack_expect_key_cstr(&r, rkeys, rfound, 2)) {
                 case 0: mpack_discard(&r); break;
-                case 1: mpack_expect_cstr(&r, g_answer,      sizeof(g_answer));      break;
-                case 2: mpack_discard(&r); break;
-                case 3: mpack_expect_cstr(&r, g_resp_session, sizeof(g_resp_session)); break;
+                case 1: mpack_expect_cstr(&r, g_answer, sizeof(g_answer)); break;
                 default: mpack_discard(&r); break;
             }
         }
@@ -113,9 +125,6 @@ int main(int argc, char** argv) {
 
         zmq_msg_close(&hdr_msg);
         zmq_msg_close(&pay_msg);
-
-        if (strcmp(g_resp_session, session_id) != 0)
-            continue;
 
         FILE* glow = popen("glow - 2>/dev/null || cat", "w");
         if (glow) {

@@ -36,6 +36,11 @@
 static char g_in [MAX_IN];
 static char g_out[MAX_OUT];
 
+/* NER buffers — static to avoid huge stack VLAs (770KB table) */
+static NerToken     g_ner_toks[NER_MAX_TOKENS];
+static uint64_t     g_ner_feats[NER_MAX_TOKENS * NER_N_FEATS];
+static float        g_ner_table[(NER_MAX_TOKENS + 1) * NER_N_FEATS_PA * NER_N_HIDDEN * NER_N_PIECES];
+
 /* ── LMDB helpers ────────────────────────────────────────────────────────── */
 
 static MDB_env *g_env;
@@ -165,7 +170,7 @@ static void ner_init(void)
 static void mask_string(const char *src, char *dst, int dst_max,
                         const char *corr)
 {
-    NerToken toks[NER_MAX_TOKENS];
+    NerToken *toks = g_ner_toks;
     int n = spacy_tokenize(src, toks, NER_MAX_TOKENS);
     if (n <= 0) {
         strncpy(dst, src, dst_max - 1);
@@ -173,10 +178,10 @@ static void mask_string(const char *src, char *dst, int dst_max,
         return;
     }
 
-    uint64_t feats[NER_MAX_TOKENS * NER_N_FEATS];
+    uint64_t *feats = g_ner_feats;
     ner_build_feature_matrix(toks, n, &g_ner->seeds, feats);
 
-    float table[(NER_MAX_TOKENS + 1) * NER_N_FEATS_PA * NER_N_HIDDEN * NER_N_PIECES];
+    float *table = g_ner_table;
     ner_model_run(g_ner, feats, n, table);
 
     NerSpan spans[NER_MAX_TOKENS];

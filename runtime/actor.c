@@ -135,7 +135,7 @@ static int zmq_setup(void) {
     char* tok = strtok(topic_buf, ",");
     while (tok) {
         while (*tok == ' ') tok++;
-        zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, tok, strlen(tok));
+        zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, tok, strlen(tok) + 1);
         tok = strtok(NULL, ",");
     }
     return 0;
@@ -469,7 +469,7 @@ int actor_run(void) {
 
         /* TTL check */
         if (actor_tuple_expired(hdr)) {
-            fprintf(stderr, "[actor] tuple expired, dropping\n");
+            fprintf(stderr, "[actor] tuple expired, dropping (topic=%.32s)\n");
             zmq_msg_close(&hdr_msg);
             zmq_msg_close(&pay_msg);
             continue;
