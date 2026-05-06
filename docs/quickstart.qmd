@@ -29,13 +29,19 @@ make
 make run
 ```
 
-This starts three processes:
+This starts two processes (no PII filtering). Or run `make run` to start the full mesh with PII tokenisation — 5 processes:
 
 ```
-[proxy]  zmq-proxy — XSUB:5557  XPUB:5556
-[actor]  sqlite-tool-1  — topic: sql_query
-[actor]  llm-agent-1    — topic: user_message, sql_result
+[proxy]   zmq-proxy    — XSUB:5557  XPUB:5556
+[actor]   tokenise-1   — topic: user_message, sql_result
+[actor]   detokenise-1 — topic: sql_query_masked, agent_response_masked
+[actor]   sqlite-tool-1 — topic: sql_query
+[actor]   llm-agent-1  — topic: user_message_masked, sql_result_masked
 ```
+
+::: {.callout-note}
+The full `make run` enables PII tokenisation by default. Everything the LLM sees is tokenised; everything it emits is detokenised. See @agents for the PII Token Bubble design.
+:::
 
 ## Chat
 
@@ -58,11 +64,23 @@ Kills all mesh processes and wipes the LMDB state directories.
 ```{mermaid}
 sequenceDiagram
   participant C  as client
-  participant BUS as bus
-  participant AG as llm-agent-1
-  participant ST as sqlite-tool-1
+  participant TK as tokenise
+  participant AG as llm-agent
+  participant DK as detokenise
+  participant DB as sqlite-tool
 
-  C  ->> BUS : user_message {query}
+  C  ->> TK : user_message {query}
+  Note over TK: mask PII entities
+  TK ->> AG : user_message_masked
+  AG ->> DK : sql_query_masked
+  Note over DK: restore real names
+  DK ->> DB : sql_query
+  DB ->> TK : sql_result
+  Note over TK: mask employee data
+  TK ->> AG : sql_result_masked
+  AG ->> DK : agent_response_masked
+  Note over DK: restore answer
+  DK ->> C  : agent_response
   BUS ->> AG : user_message
   Note over AG: call LLM, get SQL tool call
   AG ->> BUS : sql_query {sql}

@@ -5,7 +5,7 @@
 A minimal distributed actor mesh built on Unix primitives.
 No frameworks. No sidecars. No brokers. Just processes.
 
-The runtime is ~430 lines of C. The proxy is 74 lines of C.
+The runtime is ~500 lines of C. The proxy is 74 lines of C.
 A handler is any process that speaks stdio.
 
 ---
@@ -131,7 +131,8 @@ One actor instance receives tuples on all listed topics.
 ```sh
 #!/bin/sh
 payload=$(cat)
-curl -s https://api.anthropic.com/v1/messages \
+# Example with any OpenAI-compatible API:
+curl -s https://api.openai.com/v1/chat/completions \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -d "$(echo "$payload" | jq -c '{model:"claude-haiku-4-5-20251001",max_tokens:1000,messages:[{role:"user",content:.query}]}')" \
   | jq -c '{answer:.content[0].text}'
