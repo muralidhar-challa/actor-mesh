@@ -9,3 +9,5 @@ models/distilbert-ner/model.onnx
 /tmp/
 docs/_book/*
 examples/employee-mesh/handlers/pii-filter
+models/distilbert-ner/
+.claude/
