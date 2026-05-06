@@ -43,7 +43,7 @@ int main(void) {
 
     static const char* keys[] = { "type", "sql" };
     bool found[2] = { false, false };
-    char sql_val[MAX_IN];
+    static char sql_val[MAX_IN];
     sql_val[0] = '\0';
 
     uint32_t map_sz = mpack_expect_map_max(&r, 8);

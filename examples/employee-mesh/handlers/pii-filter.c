@@ -35,6 +35,7 @@
 
 static char g_in [MAX_IN];
 static char g_out[MAX_OUT];
+static char g_str_buf[MAX_MASKED + 1];
 
 /* NER buffers — static to avoid huge stack VLAs (770KB table) */
 static NerToken     g_ner_toks[NER_MAX_TOKENS];
@@ -300,14 +301,14 @@ static void walk_and_rewrite(mpack_reader_t *r, mpack_writer_t *w,
     switch (tag.type) {
     case mpack_type_str: {
         uint32_t len = tag.v.l;
-        char *buf = (char *)malloc(len + 1);
-        mpack_read_bytes(r, buf, len);
+        uint32_t copy_len = len < MAX_MASKED ? len : MAX_MASKED;
+        mpack_read_bytes(r, g_str_buf, copy_len);
+        mpack_skip_bytes(r, len - copy_len);
         mpack_done_str(r);
-        buf[len] = '\0';
+        g_str_buf[copy_len] = '\0';
         char out[MAX_MASKED];
-        fn(buf, out, sizeof(out), corr);
+        fn(g_str_buf, out, sizeof(out), corr);
         mpack_write_str(w, out, (uint32_t)strlen(out));
-        free(buf);
         break;
     }
     case mpack_type_map: {

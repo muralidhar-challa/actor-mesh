@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     uint64_t feats[NER_MAX_TOKENS * NER_N_FEATS];
     ner_build_feature_matrix(toks, n, &m->seeds, feats);
 
-    float table[(NER_MAX_TOKENS + 1) * NER_N_FEATS_PA * NER_N_HIDDEN * NER_N_PIECES];
+    static float table[(NER_MAX_TOKENS + 1) * NER_N_FEATS_PA * NER_N_HIDDEN * NER_N_PIECES];
     ner_model_run(m, feats, n, table);
 
     NerSpan spans[NER_MAX_TOKENS];

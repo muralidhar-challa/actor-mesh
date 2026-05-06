@@ -132,11 +132,11 @@ static int zmq_setup(void) {
     char topic_buf[256];
     strncpy(topic_buf, cfg.topic, sizeof(topic_buf) - 1);
     topic_buf[sizeof(topic_buf) - 1] = '\0';
-    char* tok = strtok(topic_buf, ",");
+    char *saveptr; char* tok = strtok_r(topic_buf, ",", &saveptr);
     while (tok) {
         while (*tok == ' ') tok++;
         zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, tok, strlen(tok) + 1);
-        tok = strtok(NULL, ",");
+        tok = strtok_r(NULL, ",", &saveptr);
     }
     return 0;
 }
@@ -203,7 +203,7 @@ static ssize_t invoke_handler(const actor_header_t* hdr,
     int from_handler[2];
 
     if (pipe(to_handler)   < 0) return -1;
-    if (pipe(from_handler) < 0) return -1;
+    if (pipe(from_handler) < 0) { close(to_handler[0]); close(to_handler[1]); return -1; }
 
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -238,6 +238,7 @@ static ssize_t invoke_handler(const actor_header_t* hdr,
     /* write payload → handler stdin, signal EOF */
     if (write(to_handler[1], payload, payload_len) < 0) {
         close(to_handler[1]);
+        close(from_handler[0]);
         waitpid(pid, NULL, 0);
         return -1;
     }
@@ -469,7 +470,7 @@ int actor_run(void) {
 
         /* TTL check */
         if (actor_tuple_expired(hdr)) {
-            fprintf(stderr, "[actor] tuple expired, dropping (topic=%.32s)\n");
+            fprintf(stderr, "[actor] tuple expired, dropping (topic=%.32s)\n", hdr->topic);
             zmq_msg_close(&hdr_msg);
             zmq_msg_close(&pay_msg);
             continue;
