@@ -49,11 +49,8 @@ static void lmdb_open(void)
     if (mdb_env_create(&g_env)) { perror("mdb_env_create"); exit(1); }
     mdb_env_set_mapsize(g_env, 64UL * 1024 * 1024);
     mdb_env_set_maxdbs(g_env, 2);
-    if (mdb_env_open(g_env, path, MDB_NOSUBDIR, 0664)) {
-        /* try as directory */
-        if (mdb_env_open(g_env, path, 0, 0664)) {
-            perror("mdb_env_open"); exit(1);
-        }
+    if (mdb_env_open(g_env, path, 0, 0664)) {
+        perror("mdb_env_open"); exit(1);
     }
 
     MDB_txn *txn;
@@ -63,8 +60,8 @@ static void lmdb_open(void)
 }
 
 /*
- * Look up or create a TOK_NNNN placeholder for (entity_text, label).
- * Returns the placeholder in out_tok (caller must supply ≥ 10 bytes).
+ * Look up or create a TOK_{LABEL}_{NNNN} placeholder for (entity_text, label).
+ * Returns the placeholder in out_tok (caller must supply ≥ 32 bytes).
  */
 static void get_or_create_tok(const char *corr, const char *text,
                                const char *label, char *out_tok)
@@ -81,7 +78,7 @@ static void get_or_create_tok(const char *corr, const char *text,
 
     if (mdb_get(txn, g_dbi, &k, &v) == 0) {
         /* already exists */
-        int len = v.mv_size < 9 ? (int)v.mv_size : 9;
+        int len = v.mv_size < 31 ? (int)v.mv_size : 31;
         memcpy(out_tok, v.mv_data, len);
         out_tok[len] = '\0';
         mdb_txn_abort(txn);
@@ -102,7 +99,8 @@ static void get_or_create_tok(const char *corr, const char *text,
         memcpy(tmp, cv.mv_data, l); tmp[l] = '\0';
         n = atoi(tmp);
     }
-    snprintf(out_tok, 10, "TOK_%04d", n);
+    /* format: TOK_PERSON_0000, TOK_ORG_0001, etc. */
+    snprintf(out_tok, 32, "TOK_%s_%04d", label, n);
     char ns[16]; snprintf(ns, sizeof(ns), "%d", n + 1);
     MDB_val nv = { strlen(ns), ns };
     mdb_put(txn, g_dbi, &ck, &nv, 0);
@@ -242,32 +240,44 @@ static void restore_string(const char *src, char *dst, int dst_max,
     int si = 0, di = 0;
     int slen = (int)strlen(src);
     while (si < slen && di < dst_max - 1) {
-        /* look for "TOK_" */
-        if (si + 8 <= slen &&
+        /*
+         * Match TOK_{LABEL}_{NNNN}:
+         *   "TOK_" + one or more uppercase letters + "_" + four digits
+         */
+        if (si + 9 <= slen &&
             src[si]=='T' && src[si+1]=='O' && src[si+2]=='K' && src[si+3]=='_' &&
-            isdigit((unsigned char)src[si+4]) &&
-            isdigit((unsigned char)src[si+5]) &&
-            isdigit((unsigned char)src[si+6]) &&
-            isdigit((unsigned char)src[si+7]))
+            isupper((unsigned char)src[si+4]))
         {
-            char tok[10];
-            memcpy(tok, src + si, 8); tok[8] = '\0';
-            char orig[MAX_STR];
-            if (tok_lookup(corr, tok, orig, sizeof(orig)) == 0) {
-                int ol = (int)strlen(orig);
-                if (di + ol < dst_max - 1) {
-                    memcpy(dst + di, orig, ol);
-                    di += ol;
+            int j = si + 4;
+            while (j < slen && isupper((unsigned char)src[j])) j++;
+            if (j < slen && src[j] == '_' &&
+                j+5 <= slen &&
+                isdigit((unsigned char)src[j+1]) &&
+                isdigit((unsigned char)src[j+2]) &&
+                isdigit((unsigned char)src[j+3]) &&
+                isdigit((unsigned char)src[j+4]))
+            {
+                int toklen = j + 5 - si;
+                char tok[32];
+                if (toklen < (int)sizeof(tok)) {
+                    memcpy(tok, src + si, toklen); tok[toklen] = '\0';
+                    char orig[MAX_STR];
+                    if (tok_lookup(corr, tok, orig, sizeof(orig)) == 0) {
+                        int ol = (int)strlen(orig);
+                        if (di + ol < dst_max - 1) {
+                            memcpy(dst + di, orig, ol);
+                            di += ol;
+                        }
+                    } else {
+                        memcpy(dst + di, tok, toklen);
+                        di += toklen;
+                    }
+                    si += toklen;
+                    continue;
                 }
-            } else {
-                /* unknown token — copy verbatim */
-                memcpy(dst + di, tok, 8);
-                di += 8;
             }
-            si += 8;
-        } else {
-            dst[di++] = src[si++];
         }
+        dst[di++] = src[si++];
     }
     dst[di] = '\0';
 }
