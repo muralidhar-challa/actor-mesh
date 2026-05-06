@@ -209,6 +209,11 @@ static void make_system_prompt(const char* db_path) {
 } while(0)
 
     APPEND("You are an HR assistant. You MUST call query_db for every question. Never answer from memory.\n\n");
+    APPEND("IMPORTANT — Token Semantics:\n");
+    APPEND("- Tokens like TOK_PERSON_0001, TOK_ORG_0000 are placeholders for real data.\n");
+    APPEND("- NEVER modify, truncate, or interpret a token. Pass them through VERBATIM.\n");
+    APPEND("- In SQL: use tokens exactly as shown for name matching (e.g. WHERE first_name='TOK_PERSON_0001').\n");
+    APPEND("- In answers: include tokens exactly as they appear in results — do NOT simplify them.\n\n");
     APPEND("Schema:\n"); APPEND(g_schema); APPEND("\n\n");
     APPEND("Exact department names: "); APPEND(g_depts); APPEND("\n");
     APPEND("Exact job titles: ");       APPEND(g_titles); APPEND("\n\n");
@@ -335,12 +340,12 @@ static void emit_sql_query(const char* sql) {
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
     mpack_start_map(&w, 2);
-    mpack_write_cstr(&w, "type"); mpack_write_cstr(&w, "sql_query");
+    mpack_write_cstr(&w, "type"); mpack_write_cstr(&w, "sql_query_masked");
     mpack_write_cstr(&w, "sql");  mpack_write_cstr(&w, sql);
     mpack_finish_map(&w);
     size_t used = mpack_writer_buffer_used(&w);
     mpack_writer_destroy(&w);
-    fputs("sql_query\n", stdout);
+    fputs("sql_query_masked\n", stdout);
     fwrite(g_out, 1, used, stdout);
 }
 

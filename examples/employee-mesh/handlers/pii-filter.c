@@ -2,7 +2,7 @@
  * handlers/pii-filter.c — PII mask / restore actor
  *
  * PII_MODE=mask    subscribe user_message,sql_result → emit *_masked
- * PII_MODE=restore subscribe agent_response_masked   → emit agent_response
+ * PII_MODE=restore subscribe sql_query_masked,agent_response_masked   → emit agent_response
  *
  * Env:
  *   PII_MODE              mask | restore
@@ -405,7 +405,12 @@ int main(void)
     if (is_mask) {
         snprintf(topic, sizeof(topic), "%s_masked", msg_type);
     } else {
-        snprintf(topic, sizeof(topic), "agent_response");
+        /* restore: strip _masked suffix if present */
+        size_t mlen = strlen(msg_type);
+        if (mlen > 7 && strcmp(msg_type + mlen - 7, "_masked") == 0)
+            snprintf(topic, sizeof(topic), "%.*s", (int)(mlen - 7), msg_type);
+        else
+            snprintf(topic, sizeof(topic), "%s", msg_type);
     }
 
     /* rewrite message */

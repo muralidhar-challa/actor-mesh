@@ -136,8 +136,8 @@ run-llm-agent:
 	@mkdir -p $(LMDB_BASE)/llm-agent $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=user_message,sql_result_masked \
-	ACTOR_RESULT_TOPIC=agent_response_masked \
+	ACTOR_TOPIC=user_message_masked,sql_result_masked \
+	ACTOR_RESULT_TOPIC=sql_query_masked \
 	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 	OLLAMA_URL=$(OLLAMA_URL) \
@@ -150,7 +150,7 @@ run-tokenise:
 	@mkdir -p $(LMDB_BASE)/tokenise $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=tokenise-1 \
-	ACTOR_TOPIC=sql_result \
+	ACTOR_TOPIC=user_message,sql_result \
 	ACTOR_RESULT_TOPIC=user_message_masked \
 	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
@@ -164,7 +164,7 @@ run-detokenise:
 	@mkdir -p $(LMDB_BASE)/detokenise $(LOGDIR)
 	@$(COMMON_ENV) \
 	ACTOR_ID=detokenise-1 \
-	ACTOR_TOPIC=agent_response_masked \
+	ACTOR_TOPIC=sql_query_masked,agent_response_masked \
 	ACTOR_RESULT_TOPIC=agent_response \
 	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
