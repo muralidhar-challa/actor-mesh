@@ -74,7 +74,8 @@
       "Bash(./client \"list all engineers\")",
       "Bash(g++ -O2 -std=c++11 -I. tools/test_ner_features.c vendor/smhasher/MurmurHash2.cpp vendor/smhasher/MurmurHash3.cpp -o /tmp/test_ner_features)",
       "Bash(/tmp/test_ner_features)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(python3 tools/test_ner_decode.py)"
     ]
   }
 }
