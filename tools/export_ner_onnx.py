@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-Export spaCy en_core_web_sm NER tok2vec to ONNX.
+Export spaCy en_core_web_sm full NER pipeline to ONNX.
 
 Input:  (seq_len, 16) uint64  — raw MurmurHash3 output for 4 cols × 4 keys
                                  C handler computes MurmurHash3, feeds directly.
                                  Model does Mod(nV) internally.
 
-Output: (seq_len, 64) float32 — token vectors ready for NER head scoring
+Output: (seq_len+2, nF=3, nO=64, nP=2) float32
+        Precomputed affine table for the NER greedy decoder.
+        Row 0 = boundary pad.  Rows 1..seq_len+1 = per-token features.
+
+Decoder weights stored in metadata_props:
+  pa_b      — (nO=64, nP=2)   bias added after gather-sum, before maxout
+  linear_W  — (n_moves=74, nO=64)  linear head weights
+  linear_b  — (n_moves=74,)        linear head bias
+  moves     — comma-separated BILUO move names (index == move id)
 
 Full layer map (from inspecting thinc model tree):
 
@@ -258,27 +266,112 @@ def export(output_path):
     ax0        = g.const_i64(np.array([0]))
     cur        = g.op("Slice", [cur, pad_start, pad_end, ax0], [n("unpadded")])
 
-    # ── linear 96→64 ──────────────────────────────────────────────────────────
-    out = build_linear(g, cur, proj_linear.get_param("W"), proj_linear.get_param("b"))
+    # ── linear 96→64 (tok2vec final projection) ───────────────────────────────
+    tok2vec = build_linear(g, cur, proj_linear.get_param("W"), proj_linear.get_param("b"))
     print(f"  linear: W{proj_linear.get_param('W').shape}")
 
+    # ── precomputable_affine  (seq, 64) → (seq+2, nF=3, nO=64, nP=2) ─────────
+    #
+    # Forward (from spacy/ml/parser_model.pyx):
+    #   Yf = zeros(seq+1, nF*nO*nP)
+    #   Yf[1:] = tok2vec @ W_pa.reshape(nF*nO*nP, nI).T
+    #   Yf = Yf.reshape(seq+1, nF, nO, nP)
+    #   Yf[0] = pad
+    #
+    # The big_chain prepends one boundary zero row, so tok2vec is (seq+1, 64).
+    # We replicate that boundary prepend here, then apply W_pa.
+    import spacy as _spacy
+    _nlp    = _spacy.load("en_core_web_sm")
+    _pa     = _nlp.get_pipe("ner").model._layers[1]
+    _linear = _nlp.get_pipe("ner").model._layers[2]
+
+    W_pa  = _pa.get_param("W")    # (nF=3, nO=64, nP=2, nI=64)
+    pad_pa = _pa.get_param("pad")  # (1, nF=3, nO=64, nP=2)
+    nF_pa, nO_pa, nP_pa, nI_pa = W_pa.shape
+
+    # precomputable_affine forward (parser_model.pyx):
+    #   Yf = zeros(n+1, nF*nO*nP)
+    #   Yf[1:] = tok2vec @ W.reshape(nF*nO*nP, nI).T
+    #   Yf[0]  = pad
+    # tok2vec is (seq, 64) — NO extra boundary row prepended
+    W_pa_flat = g.const_f32(W_pa.reshape(nF_pa * nO_pa * nP_pa, nI_pa))
+    yf_body   = g.op("Gemm", [tok2vec, W_pa_flat], [n("yf_body")], transB=1)
+
+    # prepend pad row: (seq, nF*nO*nP) → (seq+1, nF*nO*nP)
+    pad_flat  = g.const_f32(pad_pa.reshape(1, nF_pa * nO_pa * nP_pa))
+    yf_flat   = g.op("Concat", [pad_flat, yf_body], [n("yf_flat")], axis=0)
+
+    # reshape to (seq+1, nF, nO, nP)
+    seq_plus1 = g.op("Shape", [yf_flat], [n("sp1")], start=0, end=1)
+    shape_4d  = g.op("Concat",
+                     [seq_plus1,
+                      g.const_i64(np.array([nF_pa])),
+                      g.const_i64(np.array([nO_pa])),
+                      g.const_i64(np.array([nP_pa]))],
+                     [n("shape4d")], axis=0)
+    out = g.op("Reshape", [yf_flat, shape_4d], [n("pa_table")])
+    print(f"  precomputable_affine: W{W_pa.shape} → table (seq+1, {nF_pa}, {nO_pa}, {nP_pa})")
+
     # ── build and save ────────────────────────────────────────────────────────
+    import base64 as _b64
     graph = oh.make_graph(
         g.nodes,
-        "spacy_ner_tok2vec",
+        "spacy_ner_full",
         [oh.make_tensor_value_info(inp, onnx.TensorProto.UINT64, ["seq_len", n_keys])],
-        [oh.make_tensor_value_info(out, onnx.TensorProto.FLOAT,  ["seq_len", 64])],
+        [oh.make_tensor_value_info(out, onnx.TensorProto.FLOAT,
+                                   ["seq_plus1", nF_pa, nO_pa, nP_pa])],
         initializer=g.inits,
     )
     model_proto = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 17)])
     model_proto.ir_version = 8
 
-    # store column metadata for C handler
+    def _meta(key, value):
+        e = model_proto.metadata_props.add()
+        e.key, e.value = key, value
+
+    # hashembed column metadata (for C feature extraction)
     for col_idx, chain in enumerate(load_model()["concat_he"]._layers):
         he = chain._layers[1]
-        e  = model_proto.metadata_props.add()
-        e.key   = f"col_{col_idx}"
-        e.value = f"{columns[col_idx]}:{he.get_dim('nV')}:{he.attrs['seed']}"
+        _meta(f"col_{col_idx}", f"{columns[col_idx]}:{he.get_dim('nV')}:{he.attrs['seed']}")
+
+    # decoder weights as base64-encoded little-endian float32 bytes
+    _meta("pa_b",     _b64.b64encode(_pa.get_param("b").astype(np.float32).tobytes()).decode())
+    _meta("linear_W", _b64.b64encode(_linear.get_param("W").astype(np.float32).tobytes()).decode())
+    _meta("linear_b", _b64.b64encode(_linear.get_param("b").astype(np.float32).tobytes()).decode())
+    _meta("pa_nF",    str(nF_pa))
+    _meta("pa_nO",    str(nO_pa))
+    _meta("pa_nP",    str(nP_pa))
+
+    # BILUO move names via oracle sequences — order is B×18, I×18, L×18, U×18, O, MISSING
+    from spacy.training import Example as _Example
+    _nlp2  = _spacy.load("en_core_web_sm")
+    _moves = _nlp2.get_pipe("ner").moves
+    _ner2  = _nlp2.get_pipe("ner")
+    _labels = list(_ner2.labels)
+    _n = _moves.n_moves
+    move_names = ["MISSING"] * _n
+
+    for _lbl in _labels:
+        _ex = _Example.from_dict(_nlp2.make_doc("hello"), {"entities": [(0,5,_lbl)]})
+        try:
+            _seq = _moves.get_oracle_sequence(_ex)
+            if _seq: move_names[_seq[0]] = f"U-{_lbl}"
+        except: pass
+        _ex3 = _Example.from_dict(_nlp2.make_doc("a b c"), {"entities": [(0,5,_lbl)]})
+        try:
+            _seq3 = _moves.get_oracle_sequence(_ex3)
+            if len(_seq3) >= 3:
+                move_names[_seq3[0]] = f"B-{_lbl}"
+                move_names[_seq3[1]] = f"I-{_lbl}"
+                move_names[_seq3[2]] = f"L-{_lbl}"
+        except: pass
+    _ex_o = _Example.from_dict(_nlp2.make_doc("hi"), {"entities": []})
+    _seq_o = _moves.get_oracle_sequence(_ex_o)
+    if _seq_o: move_names[_seq_o[0]] = "O"
+
+    _meta("moves", ",".join(move_names))
+    _meta("n_moves", str(_n))
+    print(f"  moves: {_n} (sample: {move_names[:4]} ...)")
 
     print("\nChecking ONNX model ...")
     onnx.checker.check_model(model_proto)
