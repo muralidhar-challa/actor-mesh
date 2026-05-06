@@ -19,9 +19,15 @@ RUNTIME = $(ROOT)/runtime
 VENDOR  = $(ROOT)/vendor
 
 CC           = gcc
-CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack
+CXX          = g++
+CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack -I$(ROOT)
 LIBS         = -lzmq -llmdb
 HANDLER_LIBS = -lcurl -llmdb
+
+NER_MODEL    ?= $(abspath ../../models/ner.onnx)
+NER_INCS     = -I$(ROOT)/vendor/smhasher -I$(ROOT) -I/usr/include/onnxruntime
+NER_LIBS     = -lonnxruntime -lstdc++
+SMHASHER     = $(ROOT)/vendor/smhasher/MurmurHash2.cpp
 
 MPACK_SRCS = \
 	$(VENDOR)/mpack/src/mpack/mpack-common.c \
@@ -48,7 +54,7 @@ client: client.c $(MPACK_SRCS)
 tui: tui.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o tui
 
-handlers: handlers/llm-agent handlers/sqlite-tool
+handlers: handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
 
 handlers/llm-agent: handlers/llm-agent.c $(MPACK_SRCS) $(CJSON)
 	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
@@ -56,8 +62,12 @@ handlers/llm-agent: handlers/llm-agent.c $(MPACK_SRCS) $(CJSON)
 handlers/sqlite-tool: handlers/sqlite-tool.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o handlers/sqlite-tool
 
+handlers/pii-filter: handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER)
+	$(CXX) $(CFLAGS) $(NER_INCS) handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER) \
+		$(HANDLER_LIBS) $(NER_LIBS) -o handlers/pii-filter
+
 clean:
-	rm -f client tui handlers/llm-agent handlers/sqlite-tool
+	rm -f client tui handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -142,8 +152,10 @@ run-tokenise:
 	ACTOR_ID=tokenise-1 \
 	ACTOR_TOPIC=user_message,sql_result \
 	ACTOR_RESULT_TOPIC=user_message_masked \
-	ACTOR_HANDLER="python3 $(abspath handlers/tokenise.py)" \
+	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
+	PII_MODE=mask \
+	NER_MODEL_PATH=$(NER_MODEL) \
 	TOKENMAP_PATH=$(TOKENMAP_PATH) \
 	$(ACTOR) >>$(LOGDIR)/tokenise.log 2>&1 &
 	@echo "[actor] tokenise started  (log: $(LOGDIR)/tokenise.log)"
@@ -154,8 +166,9 @@ run-detokenise:
 	ACTOR_ID=detokenise-1 \
 	ACTOR_TOPIC=agent_response_masked \
 	ACTOR_RESULT_TOPIC=agent_response \
-	ACTOR_HANDLER="python3 $(abspath handlers/detokenise.py)" \
+	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
+	PII_MODE=restore \
 	TOKENMAP_PATH=$(TOKENMAP_PATH) \
 	$(ACTOR) >>$(LOGDIR)/detokenise.log 2>&1 &
 	@echo "[actor] detokenise started  (log: $(LOGDIR)/detokenise.log)"
