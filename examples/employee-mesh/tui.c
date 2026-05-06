@@ -485,7 +485,7 @@ int main(void) {
 
     g_sub = zmq_socket(g_ctx, ZMQ_SUB);
     zmq_connect(g_sub, BUS_SUB);
-    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "agent_response", 14);
+    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "agent_response", 15);
     zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "heartbeat",       9);
     zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "sql_query",       9);
     zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "sql_result",     10);

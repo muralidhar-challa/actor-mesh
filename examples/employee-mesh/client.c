@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
 
     void* sub = zmq_socket(ctx, ZMQ_SUB);
     zmq_connect(sub, BUS_SUB);
-    zmq_setsockopt(sub, ZMQ_SUBSCRIBE, "agent_response", 14);
+    zmq_setsockopt(sub, ZMQ_SUBSCRIBE, "agent_response", 15);
 
     void* pub = zmq_socket(ctx, ZMQ_PUB);
     zmq_connect(pub, BUS_PUB);
@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
         const actor_header_t* hdr_in = (const actor_header_t*)zmq_msg_data(&hdr_msg);
 
         /* match by correlation_id (same as TUI) */
+
         if (memcmp(hdr_in->correlation_id, g_corr_id, 16) != 0) {
             zmq_msg_close(&hdr_msg);
             zmq_msg_close(&pay_msg);
