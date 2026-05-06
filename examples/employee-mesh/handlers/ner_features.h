@@ -143,6 +143,26 @@ static inline void ner_shape(const char *tok, int len, char *out, int *out_len)
  * titles directly preceding names — add the exception table if this becomes a
  * problem in production.
  */
+/* Titles and abbreviations that spaCy keeps as single tokens (with trailing dot). */
+static inline int _is_abbrev(const char *s, int len)
+{
+    /* lowercase the chunk for comparison */
+    char low[16];
+    if (len <= 0 || len >= (int)sizeof(low)) return 0;
+    for (int i = 0; i < len; i++)
+        low[i] = (char)tolower((unsigned char)s[i]);
+    low[len] = '\0';
+    static const char *abbrevs[] = {
+        "mr","mrs","ms","dr","prof","sr","jr","st","vs","dept","corp","inc","ltd","co",
+        "gov","gen","sgt","cpl","pvt","rep","sen","rev","hon","est","approx","appt",
+        "ave","blvd","rd","ln","ct",
+        NULL
+    };
+    for (int i = 0; abbrevs[i]; i++)
+        if (strcmp(low, abbrevs[i]) == 0) return 1;
+    return 0;
+}
+
 static inline int spacy_tokenize(const char *text, NerToken *toks, int max_toks)
 {
     int n = 0;
@@ -166,8 +186,14 @@ static inline int spacy_tokenize(const char *text, NerToken *toks, int max_toks)
 
         /* strip trailing punctuation (only if some non-punct remains) */
         int rp = 0;
-        if (lp < clen)
+        if (lp < clen) {
             while (rp < clen - lp && ispunct((unsigned char)text[end - 1 - rp])) rp++;
+            /* if the only trailing punct is a dot and the core is an abbreviation,
+             * keep it attached (e.g. "Dr." stays as one token, not "Dr" + ".") */
+            if (rp == 1 && text[end - 1] == '.' &&
+                _is_abbrev(text + start + lp, clen - lp - 1))
+                rp = 0;
+        }
 
         /* emit leading punct tokens one char at a time */
         for (int k = 0; k < lp && n < max_toks; k++) {
