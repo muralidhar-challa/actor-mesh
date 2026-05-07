@@ -269,7 +269,7 @@ static inline void ner_model_run(
         (void *)feats,
         (size_t)n_toks * NER_N_FEATS * sizeof(uint64_t),
         in_shape, 2,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
         &in_tensor));
 
     const char *in_names[]  = { "token_hashes" };
