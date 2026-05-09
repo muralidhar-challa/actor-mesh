@@ -1,0 +1,94 @@
+# Appendix {.unnumbered}
+
+## Design Lineage {.unnumbered}
+
+This design independently converges on ideas that have proven themselves over decades:
+
+| Lineage | Connection |
+|---|---|
+| **Erlang/OTP (1986)** | Actor model, let it crash, message passing |
+| **Unix pipes (1969)** | stdio as the universal process interface |
+| **Linda tuplespace (1986)** | Decoupled coordination via shared space |
+| **Plan 9** | Everything is a file; communicate via read/write |
+
+The difference: C native, zero framework, same binary from edge to cloud.
+
+## Configuration Reference {.unnumbered}
+
+### Runtime Env Vars
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `ACTOR_ID` | yes  | — | Unique instance id |
+| `ACTOR_TOPIC` | yes  | — | ZMQ subscription topic (comma-separated) |
+| `ACTOR_RESULT_TOPIC` | yes  | — | Default publish topic |
+| `ACTOR_BUS_SUB` | yes  | — | ZMQ XPUB endpoint e.g. `tcp://bus:5556` |
+| `ACTOR_BUS_PUB` | yes  | — | ZMQ XSUB endpoint e.g. `tcp://bus:5557` |
+| `ACTOR_HANDLER` | yes  | — | Handler binary path (or shell command) |
+| `ACTOR_LMDB_PATH` | yes  | — | LMDB directory path |
+| `ACTOR_TTL_NS` | no  | 0 | Default tuple TTL in nanoseconds |
+| `ACTOR_HEARTBEAT_MS` | no  | 5000 | Heartbeat interval (0 = disabled) |
+| `ACTOR_RETRY_MAX` | no  | 3 | Max handler retries |
+| `ACTOR_MAX_PAYLOAD` | no  | 1MB | Build-time override for payload cap |
+
+### Proxy Env Vars
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROXY_XSUB_BIND` | `tcp://*:5557` | Actors publish here |
+| `PROXY_XPUB_BIND` | `tcp://*:5556` | Actors subscribe here |
+| `PROXY_COMPRESS` | `none` | `zlib`, `zstd`, or `none` |
+
+### Handler Env Vars (inherited from actor)
+
+| Variable | Set by | Description |
+|---|---|---|
+| `ACTOR_TUPLE_ID` | runtime | Hex ID of incoming tuple |
+| `ACTOR_CORRELATION_ID` | runtime | Hex correlation ID — stable across chain |
+| `ACTOR_CAUSATION_ID` | runtime | Hex ID of direct parent tuple |
+| `ACTOR_TUPLE_ORIGIN` | runtime | Actor ID that emitted the tuple |
+| `ACTOR_ATTEMPT` | runtime | Retry count (0 = first delivery) |
+| `ACTOR_LMDB_PATH` | runtime | Path to actor's LMDB directory |
+
+### Employee Mesh Handler Env Vars
+
+| Variable | Handler | Default | Description |
+|---|---|---|---|
+| `OLLAMA_URL` | llm-agent | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_MODEL` | llm-agent | `gemma4:e2b` | Model name |
+| `OLLAMA_API_KEY` | llm-agent | — | Bearer token for external APIs |
+| `EMPLOYEE_DB` | llm-agent, sqlite-tool | `./employee.db` | SQLite database path |
+| `PII_MODE` | pii-filter | `mask` | `mask` or `restore` |
+| `TOKENMAP_PATH` | pii-filter | — | LMDB token map directory |
+| `NER_MODEL_PATH` | pii-filter | — | ONNX NER model path |
+
+## Topic Reference {.unnumbered}
+
+| Topic | Publisher | Subscriber | Contains |
+|---|---|---|---|
+| `user_message` | client/tui | tokenise | Raw user query with real names |
+| `user_message_masked` | tokenise | llm-agent | Query with entity tokens |
+| `sql_query` | detokenise | sqlite-tool | Detokenised SQL |
+| `sql_result` | sqlite-tool | tokenise | Raw DB rows with real PII |
+| `sql_result_masked` | tokenise | llm-agent | DB rows with PII tokens |
+| `sql_query_masked` | llm-agent | detokenise | SQL with entity tokens |
+| `agent_response_masked` | llm-agent | detokenise | Answer with PII tokens |
+| `agent_response` | detokenise | client/tui | Clean restored answer |
+| `heartbeat` | all actors | tui/monitors | Actor status and inbox/outbox counts |
+
+## Glossary {.unnumbered}
+
+**BSS** — Block Started by Symbol. Memory for static variables. Zero-initialized, allocated once at process start, not stored in the binary on disk. All large buffers in the project use BSS via `static` declarations.
+
+**RSS** — Resident Set Size. Physical RAM actually occupied by a process. BSS pages don't count toward RSS until written to.
+
+**Correlation ID** — A UUIDv7 that flows through the entire tuple chain. Set by the first publisher (client/TUI), inherited by every downstream tuple. Used as the LMDB key for cross-turn state and token maps.
+
+**Dedup** — Duplicate delivery prevention. Handlers write the `ACTOR_TUPLE_ID` into an LMDB database with `MDB_NOOVERWRITE`. If the key already exists, the handler exits silently.
+
+**ReAct** — Reason + Act. The agentic loop pattern: think about what to do, call a tool, observe the result, repeat. On the mesh this is a message flow, not control flow.
+
+> The runtime does not know what a message means.  
+> The handler does not know where the message came from.  
+> The bus does not know who is subscribed.  
+> This is the design.

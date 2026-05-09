@@ -11,3 +11,5 @@ docs/_book/*
 examples/employee-mesh/handlers/pii-filter
 models/distilbert-ner/
 .claude/
+__pycache__/
+*.onnx.data
