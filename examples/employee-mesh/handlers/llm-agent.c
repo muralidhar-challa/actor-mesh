@@ -122,9 +122,10 @@ static int dedup_check(MDB_env* env, const char* tuple_id) {
     return rc == MDB_KEYEXIST;
 }
 
-/* ── Ollama ──────────────────────────────────────────────────────────────── */
+/* ── OpenAI-compatible chat (DeepSeek, OpenAI, etc.) ────────────────────── */
 
-static const char* ollama_chat(const char* url, const char* model,
+static const char* openai_chat(const char* base_url, const char* api_key,
+                               const char* model,
                                cJSON* messages, cJSON* tools) {
     cJSON* req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", model);
@@ -141,8 +142,15 @@ static const char* ollama_chat(const char* url, const char* model,
 
     CURL* ch = curl_easy_init();
     char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "%s/api/chat", url);
-    struct curl_slist* hdrs = curl_slist_append(NULL, "content-type: application/json");
+    snprintf(endpoint, sizeof(endpoint), "%s/v1/chat/completions", base_url);
+
+    struct curl_slist* hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "content-type: application/json");
+    if (api_key && *api_key) {
+        char auth[512];
+        snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+        hdrs = curl_slist_append(hdrs, auth);
+    }
 
     curl_easy_setopt(ch, CURLOPT_URL,           endpoint);
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
@@ -210,10 +218,10 @@ static void make_system_prompt(const char* db_path) {
 
     APPEND("You are an HR assistant. You MUST call query_db for every question. Never answer from memory.\n\n");
     APPEND("IMPORTANT — Token Semantics:\n");
-    APPEND("- Tokens like TOK_PERSON_0001, TOK_ORG_0000 are placeholders for real data.\n");
-    APPEND("- NEVER modify, truncate, or interpret a token. Pass them through VERBATIM.\n");
-    APPEND("- In SQL: use tokens exactly as shown for name matching (e.g. WHERE first_name='TOK_PERSON_0001').\n");
-    APPEND("- In answers: include tokens exactly as they appear in results — do NOT simplify them.\n\n");
+    APPEND("- Strings matching TOK_[A-Z]+_[0-9]+ (e.g. TOK_PERSON_0001, TOK_ORG_0000) are opaque identifiers. Copy them character-for-character, preserving exact uppercase and underscores. Never reformat, rename, or paraphrase them.\n");
+    APPEND("- Do NOT mention or explain these tokens to the user.\n");
+    APPEND("- In SQL: use tokens exactly as shown (e.g. WHERE first_name='TOK_PERSON_0001').\n");
+    APPEND("- In answers: reproduce tokens character-for-character as they appear in results.\n\n");
     APPEND("Schema:\n"); APPEND(g_schema); APPEND("\n\n");
     APPEND("Exact department names: "); APPEND(g_depts); APPEND("\n");
     APPEND("Exact job titles: ");       APPEND(g_titles); APPEND("\n\n");
@@ -384,10 +392,11 @@ static void save_state(MDB_env* env, const char* key,
 int main(void) {
     size_t n = fread(g_in, 1, sizeof(g_in) - 1, stdin);
 
-    const char* corr_id = getenv("ACTOR_CORRELATION_ID");
-    const char* ollama  = getenv("OLLAMA_URL");   if (!ollama)  ollama  = "http://localhost:11434";
-    const char* model   = getenv("OLLAMA_MODEL"); if (!model)   model   = "gemma4:e2b";
-    const char* db_path = getenv("EMPLOYEE_DB");  if (!db_path) db_path = "./employee.db";
+    const char* corr_id  = getenv("ACTOR_CORRELATION_ID");
+    const char* base_url = getenv("LLM_BASE_URL"); if (!base_url) base_url = "https://api.deepseek.com";
+    const char* api_key  = getenv("LLM_API_KEY");
+    const char* model    = getenv("LLM_MODEL");    if (!model)    model    = "deepseek-chat";
+    const char* db_path  = getenv("EMPLOYEE_DB");  if (!db_path)  db_path  = "./employee.db";
 
     if (!corr_id || !*corr_id) {
         emit_answer("internal error: no correlation id");
@@ -536,7 +545,7 @@ int main(void) {
         msgs_to_send = stripped;
     }
 
-    const char* resp_raw = ollama_chat(ollama, model, msgs_to_send, tools);
+    const char* resp_raw = openai_chat(base_url, api_key, model, msgs_to_send, tools);
     if (stripped) cJSON_Delete(stripped);
     if (tools)    cJSON_Delete(tools);
 
@@ -554,18 +563,22 @@ int main(void) {
     }
 
     {
-        cJSON* msg        = cJSON_GetObjectItem(resp, "message");
-        cJSON* tool_calls = cJSON_GetObjectItem(msg,  "tool_calls");
+        cJSON* choices    = cJSON_GetObjectItem(resp, "choices");
+        cJSON* choice0    = cJSON_GetArrayItem(choices, 0);
+        cJSON* msg        = cJSON_GetObjectItem(choice0, "message");
+        cJSON* tool_calls = cJSON_GetObjectItem(msg, "tool_calls");
         const char* content = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "content"));
 
         if (tool_calls && cJSON_GetArraySize(tool_calls) > 0) {
             /* save state: history + full react messages + round, emit sql */
             cJSON_AddItemToArray(messages, cJSON_Duplicate(msg, 1));
 
-            cJSON* tc   = cJSON_GetArrayItem(tool_calls, 0);
-            cJSON* args = cJSON_GetObjectItem(
-                              cJSON_GetObjectItem(tc, "function"), "arguments");
-            const char* sql = cJSON_GetStringValue(cJSON_GetObjectItem(args, "sql"));
+            cJSON* tc        = cJSON_GetArrayItem(tool_calls, 0);
+            cJSON* fn        = cJSON_GetObjectItem(tc, "function");
+            /* OpenAI returns arguments as a JSON string — parse it */
+            const char* args_str = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "arguments"));
+            cJSON* args      = args_str ? cJSON_Parse(args_str) : NULL;
+            const char* sql  = args ? cJSON_GetStringValue(cJSON_GetObjectItem(args, "sql")) : NULL;
 
             if (!sql || !*sql) {
                 emit_answer("error: model returned empty sql");
@@ -574,6 +587,7 @@ int main(void) {
                 save_state(env, corr_id, history, messages, round);
                 emit_sql_query(sql);
             }
+            if (args) cJSON_Delete(args);
         } else {
             /* final answer: append to history and persist memory */
             cJSON* asst = cJSON_CreateObject();

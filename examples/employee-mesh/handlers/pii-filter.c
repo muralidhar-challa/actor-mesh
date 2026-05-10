@@ -218,7 +218,7 @@ static void mask_string(const char *src, char *dst, int dst_max,
         }
 
         /* get or create placeholder */
-        char tok[10];
+        char tok[32];
         get_or_create_tok(corr, ent, spans[i].label, tok);
 
         int tlen = (int)strlen(tok);

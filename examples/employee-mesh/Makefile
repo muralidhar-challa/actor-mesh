@@ -82,10 +82,11 @@ PROXY_XPUB_BIND ?= tcp://*:5556
 BUS_SUB         ?= tcp://localhost:5556
 BUS_PUB         ?= tcp://localhost:5557
 
-# ── Ollama ─────────────────────────────────────────────────────────────────
+# ── LLM (OpenAI-compatible: DeepSeek, OpenAI, etc.) ───────────────────────
 
-OLLAMA_URL   ?= http://localhost:11434
-OLLAMA_MODEL ?= gemma4:e2b
+LLM_BASE_URL ?= https://api.deepseek.com
+LLM_API_KEY  ?=
+LLM_MODEL    ?= deepseek-chat
 
 # ── Common actor env ───────────────────────────────────────────────────────
 
@@ -140,8 +141,9 @@ run-llm-agent:
 	ACTOR_RESULT_TOPIC=sql_query_masked \
 	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
 	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
-	OLLAMA_URL=$(OLLAMA_URL) \
-	OLLAMA_MODEL=$(OLLAMA_MODEL) \
+	LLM_BASE_URL=$(LLM_BASE_URL) \
+	LLM_API_KEY=$(LLM_API_KEY) \
+	LLM_MODEL=$(LLM_MODEL) \
 	EMPLOYEE_DB=$(EMPLOYEE_DB) \
 	$(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
 	@echo "[actor] llm-agent started  (log: $(LOGDIR)/llm-agent.log)"
