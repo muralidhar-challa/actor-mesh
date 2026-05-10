@@ -12,19 +12,31 @@ sudo apt install libzmq3-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev lib
 sudo dnf install zeromq-devel lmdb-devel libcurl-devel sqlite-devel ncurses-devel
 ```
 
-Ollama running locally with a model:
+An OpenAI-compatible LLM API (DeepSeek, OpenAI, or local Ollama):
 
 ```sh
-ollama pull gemma4:e2b
+# DeepSeek (recommended) — get a key at platform.deepseek.com
+export LLM_API_KEY=sk-...
+export LLM_MODEL=deepseek-chat
+
+# Or local Ollama
+export LLM_BASE_URL=http://localhost:11434
+export LLM_MODEL=gemma4:e2b
 ```
 
 ONNX Runtime (for PII NER filtering):
 
 ```sh
-# Fedora
+# Fedora/RHEL
 sudo dnf install onnxruntime-devel
 
-# Or build from source: https://github.com/microsoft/onnxruntime
+# Debian/Ubuntu — not in apt, install from upstream release:
+curl -L https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz \
+  | tar xz -C /tmp
+sudo mkdir -p /usr/include/onnxruntime
+sudo cp -r /tmp/onnxruntime-linux-x64-1.20.1/include/* /usr/include/onnxruntime/
+sudo cp /tmp/onnxruntime-linux-x64-1.20.1/lib/*.so* /usr/lib/
+sudo ldconfig
 ```
 
 Python (for build tools only — the mesh itself is pure C):
@@ -62,7 +74,7 @@ examples/employee-mesh/
 
 ```sh
 cd examples/employee-mesh
-make run
+make run LLM_API_KEY=sk-... LLM_MODEL=deepseek-chat
 ```
 
 This starts 5 processes:
@@ -73,7 +85,7 @@ This starts 5 processes:
 | `tokenise-1` | `user_message`, `sql_result` | Mask PII before LLM |
 | `detokenise-1` | `sql_query_masked`, `agent_response_masked` | Restore PII after LLM |
 | `sqlite-tool-1` | `sql_query` | Execute SQL |
-| `llm-agent-1` | `user_message_masked`, `sql_result_masked` | ReAct agent (Ollama) |
+| `llm-agent-1` | `user_message_masked`, `sql_result_masked` | ReAct agent (OpenAI-compatible LLM) |
 
 ## Query
 
@@ -134,9 +146,10 @@ The LLM never sees real PII. Everything entering its context is tokenised (`TOK_
 All behaviour is controlled by environment variables. See @appendix for the complete reference. The key ones:
 
 ```sh
-# LLM backend
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=gemma4:e2b
+# LLM backend (OpenAI-compatible)
+LLM_BASE_URL=https://api.deepseek.com   # or http://localhost:11434 for Ollama
+LLM_API_KEY=sk-...                      # not needed for Ollama
+LLM_MODEL=deepseek-chat                 # or gemma4:e2b for Ollama
 
 # PII filtering
 NER_MODEL_PATH=models/ner.onnx
@@ -149,7 +162,7 @@ TOKENMAP_PATH=/tmp/actor-mesh/tokenmap
 
 **"mdb_env_open: No such file or directory"** — the tokenmap directory wasn't created. `make run` should create it; if running actors manually, ensure `TOKENMAP_PATH` exists.
 
-**Client times out** — the ReAct loop can take 30-90 seconds with local Ollama. The client has a 10-minute timeout. Check Ollama is running: `curl http://localhost:11434/api/tags`.
+**Client times out** — the ReAct loop can take 30-90 seconds with a local model. The client has a 10-minute timeout. For Ollama, check it is running: `curl http://localhost:11434/api/tags`. For remote APIs, verify your key with `curl https://api.deepseek.com/v1/models -H "Authorization: Bearer $LLM_API_KEY"`.
 
 **Port already in use** — `make stop` or `pkill zmq-proxy` to free ports 5556/5557.
 
