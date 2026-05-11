@@ -13,3 +13,4 @@ models/distilbert-ner/
 .claude/
 __pycache__/
 *.onnx.data
+*.pt
