@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 # ── Load from cache/disk (no HuggingFace API calls) ──────────────────────
 print("Loading Few-NERD from cache...")
-fewnerd = load_dataset('DFKI-SLT/few-nerd', 'supervised', trust_remote_code=True)
+fewnerd = load_dataset('DFKI-SLT/few-nerd', 'supervised')
 
 print("Loading WNUT from pickle...")
 wnut = pickle.load(open('/tmp/wnut.pkl', 'rb'))
@@ -103,7 +103,7 @@ class ResidualBlock(nn.Module):
         residual = x; out = self.conv(x); out = out.transpose(1,2); out = self.norm(out); out = out.transpose(1,2); out = torch.relu(out); out = self.drop(out); return out + residual
 
 class ContextCNN(nn.Module):
-    def __init__(self, embed_dim=128, n_classes=9):
+    def __init__(self, embed_dim=96, n_classes=9):
         super().__init__()
         self.hash_embeds = nn.ModuleList([HashEmbed(5000, embed_dim), HashEmbed(1000, embed_dim), HashEmbed(2500, embed_dim), HashEmbed(2500, embed_dim)])
         self.proj = nn.Linear(embed_dim*4, embed_dim); self.norm_in = nn.LayerNorm(embed_dim)
@@ -126,7 +126,7 @@ class ContextCNN(nn.Module):
 
 # ── Training ────────────────────────────────────────────────────────────
 device = torch.device('cuda')
-model = ContextCNN(embed_dim=128, n_classes=9).to(device)
+model = ContextCNN(embed_dim=96, n_classes=9).to(device)
 print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
