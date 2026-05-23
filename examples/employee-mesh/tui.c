@@ -16,7 +16,7 @@
  *   └────────────────────────────────────────────────┘
  *
  * Keys: Enter=send  PgUp/PgDn or ↑↓=scroll  Ctrl-C=quit
- * Deps: libncursesw libzmq libpthread mpack (vendored)
+ * Deps: libncursesw libnng libpthread mpack (vendored)
  */
 
 #define _GNU_SOURCE
@@ -34,7 +34,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <zmq.h>
+#include <nng/nng.h>
+#include <nng/protocol/pubsub0/pub.h>
+#include <nng/protocol/pubsub0/sub.h>
 
 /* ── Limits ──────────────────────────────────────────────────────────────── */
 
@@ -93,9 +95,8 @@ static pthread_mutex_t g_lock  = PTHREAD_MUTEX_INITIALIZER;
 static bool            g_dirty = false;
 static volatile bool   g_run   = true;
 
-static void *g_ctx = NULL;
-static void *g_pub = NULL;
-static void *g_sub = NULL;
+static nng_socket g_pub;
+static nng_socket g_sub;
 
 static char g_input[TUI_MAX_INPUT + 1];
 static int  g_ilen = 0;
@@ -347,48 +348,47 @@ static void send_message(const char *query) {
     actor_uuid_gen(hdr.id);
     hdr.ttl = 60LL * 1000000000LL; /* drop if unprocessed after 60s */
 
-    zmq_send(g_pub, &hdr, sizeof(actor_header_t), ZMQ_SNDMORE);
-    zmq_send(g_pub, g_send_buf, plen, 0);
+    /* assemble header + payload into one contiguous message */
+    static uint8_t frame_buf[sizeof(actor_header_t) + MAX_SEND];
+    memcpy(frame_buf, &hdr, sizeof(actor_header_t));
+    memcpy(frame_buf + sizeof(actor_header_t), g_send_buf, plen);
+    nng_send(g_pub, frame_buf, sizeof(actor_header_t) + plen, 0);
 }
 
-/* ── ZMQ receive thread ──────────────────────────────────────────────────── */
+/* ── NNG receive thread ──────────────────────────────────────────────────── */
 
-static void *zmq_thread(void *arg) {
+static void *recv_thread(void *arg) {
     (void)arg;
 
     static char ans[MAX_RECV];
 
-    zmq_pollitem_t items[1];
-    items[0].socket = g_sub;
-    items[0].events = ZMQ_POLLIN;
+    nng_socket_set_ms(g_sub, NNG_OPT_RECVTIMEO, 200);
 
     while (g_run) {
-        if (zmq_poll(items, 1, 200) <= 0) continue;
+        nng_msg* msg = NULL;
+        int rc = nng_recvmsg(g_sub, &msg, 0);
+        if (rc == NNG_ETIMEDOUT) continue;
+        if (rc != 0) break;
 
-        zmq_msg_t hdr_msg, pay_msg;
-        zmq_msg_init(&hdr_msg);
-        zmq_msg_recv(&hdr_msg, g_sub, 0);
-        zmq_msg_init(&pay_msg);
-        if (zmq_msg_more(&hdr_msg))
-            zmq_msg_recv(&pay_msg, g_sub, 0);
+        void*  body      = nng_msg_body(msg);
+        size_t body_len  = nng_msg_len(msg);
 
-        if (zmq_msg_size(&hdr_msg) < sizeof(actor_header_t)) {
-            zmq_msg_close(&hdr_msg);
-            zmq_msg_close(&pay_msg);
+        if (body_len < sizeof(actor_header_t)) {
+            nng_msg_free(msg);
             continue;
         }
 
-        const actor_header_t *hdr  = (const actor_header_t *)zmq_msg_data(&hdr_msg);
-        const char           *body = (const char *)zmq_msg_data(&pay_msg);
-        size_t                blen = zmq_msg_size(&pay_msg);
+        const actor_header_t *hdr  = (const actor_header_t *)body;
+        const char           *payload_ptr = (const char *)body + sizeof(actor_header_t);
+        size_t                plen = body_len - sizeof(actor_header_t);
 
         char topic[33] = {0};
         memcpy(topic, hdr->topic, 32);
 
         if (strcmp(topic, "heartbeat") == 0) {
-            if (blen < sizeof(g_recv_buf)) {
-                memcpy(g_recv_buf, body, blen);
-                g_recv_buf[blen] = '\0';
+            if (plen < sizeof(g_recv_buf)) {
+                memcpy(g_recv_buf, payload_ptr, plen);
+                g_recv_buf[plen] = '\0';
                 parse_heartbeat(g_recv_buf);
             }
 
@@ -416,7 +416,7 @@ static void *zmq_thread(void *arg) {
 
             ans[0] = '\0';
             mpack_reader_t r;
-            mpack_reader_init_data(&r, body, blen);
+            mpack_reader_init_data(&r, payload_ptr, plen);
             static const char *keys[] = { "type", "answer" };
             bool found[2] = { false, false };
             uint32_t sz = mpack_expect_map_max(&r, 4);
@@ -458,8 +458,7 @@ static void *zmq_thread(void *arg) {
         }
 
 next:
-        zmq_msg_close(&hdr_msg);
-        zmq_msg_close(&pay_msg);
+        nng_msg_free(msg);
     }
 
     return NULL;
@@ -481,18 +480,31 @@ int main(void) {
     actor_uuid_gen(g_corr_id);
     memset(g_last_id, 0, 16); /* no causation for the first message */
 
-    g_ctx = zmq_ctx_new();
+    int rc;
 
-    g_sub = zmq_socket(g_ctx, ZMQ_SUB);
-    zmq_connect(g_sub, BUS_SUB);
-    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "agent_response", 15);
-    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "heartbeat",       9);
-    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "sql_query",       9);
-    zmq_setsockopt(g_sub, ZMQ_SUBSCRIBE, "sql_result",     10);
+    if ((rc = nng_sub0_open(&g_sub)) != 0) {
+        fprintf(stderr, "[tui] nng_sub0_open: %s\n", nng_strerror(rc));
+        return 1;
+    }
+    if ((rc = nng_dial(g_sub, BUS_SUB, NULL, 0)) != 0) {
+        fprintf(stderr, "[tui] sub dial: %s\n", nng_strerror(rc));
+        return 1;
+    }
+    nng_socket_set(g_sub, NNG_OPT_SUB_SUBSCRIBE, "agent_response", 15);
+    nng_socket_set(g_sub, NNG_OPT_SUB_SUBSCRIBE, "heartbeat",       9);
+    nng_socket_set(g_sub, NNG_OPT_SUB_SUBSCRIBE, "sql_query",       9);
+    nng_socket_set(g_sub, NNG_OPT_SUB_SUBSCRIBE, "sql_result",     10);
 
-    g_pub = zmq_socket(g_ctx, ZMQ_PUB);
-    zmq_connect(g_pub, BUS_PUB);
+    if ((rc = nng_pub0_open(&g_pub)) != 0) {
+        fprintf(stderr, "[tui] nng_pub0_open: %s\n", nng_strerror(rc));
+        return 1;
+    }
+    if ((rc = nng_dial(g_pub, BUS_PUB, NULL, 0)) != 0) {
+        fprintf(stderr, "[tui] pub dial: %s\n", nng_strerror(rc));
+        return 1;
+    }
 
+    /* warm-up: let NNG establish connections before sending */
     struct timespec warm = { .tv_sec = 0, .tv_nsec = 500000000 };
     nanosleep(&warm, NULL);
 
@@ -518,7 +530,7 @@ int main(void) {
     signal(SIGTERM,  on_signal);
 
     pthread_t tid;
-    pthread_create(&tid, NULL, zmq_thread, NULL);
+    pthread_create(&tid, NULL, recv_thread, NULL);
 
     redraw();
 
@@ -632,9 +644,8 @@ int main(void) {
     delwin(g_winput);
     endwin();
 
-    zmq_close(g_pub);
-    zmq_close(g_sub);
-    zmq_ctx_destroy(g_ctx);
+    nng_close(g_pub);
+    nng_close(g_sub);
 
     return 0;
 }

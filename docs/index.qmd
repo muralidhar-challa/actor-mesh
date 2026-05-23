@@ -5,14 +5,14 @@ An actor mesh is three ideas held together tightly: a **message bus** that nobod
 ```{=html}
 <div class="stat-row">
   <div class="stat"><div class="stat-num">506</div><div class="stat-lbl">LOC — runtime</div></div>
-  <div class="stat"><div class="stat-num">74</div><div class="stat-lbl">LOC — proxy</div></div>
+  <div class="stat"><div class="stat-num">57</div><div class="stat-lbl">LOC — proxy</div></div>
   <div class="stat"><div class="stat-num">256 B</div><div class="stat-lbl">Fixed header</div></div>
   <div class="stat"><div class="stat-num">1 MB</div><div class="stat-lbl">Max payload</div></div>
   <div class="stat"><div class="stat-num">0</div><div class="stat-lbl">Heap allocs in runtime</div></div>
 </div>
 ```
 
-The runtime is ~506 lines of C. The proxy is 74 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
+The runtime is ~506 lines of C. The proxy is 57 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
 
 ```
 SQL Tool   →  actor + handlers/sqlite-tool   subscribes to: sql_query
@@ -40,6 +40,6 @@ A shell script that reads from `stdin` and writes to `stdout` is a fully valid, 
 
 **Not a framework.** There is no SDK to import. No base class to extend. No decorator to apply. The only interface is `stdin` and `stdout` — a contract that has been stable since 1969. You do not write actors in the actor mesh style. You write processes, and the mesh runs them.
 
-**Not a message queue.** Kafka, RabbitMQ, SQS — queues hold messages, guarantee ordering, track consumer offsets, and require brokers with their own operational surface. The proxy here is 74 lines of C. It holds nothing. It is a wire junction, not a store.
+**Not a message queue.** Kafka, RabbitMQ, SQS — queues hold messages, guarantee ordering, track consumer offsets, and require brokers with their own operational surface. The proxy here is 57 lines of C. It holds nothing. It is a wire junction, not a store.
 
 **Not comparable to any of the above.** Those tools solve the problem of coordinating work across processes by adding a layer that understands the work. This solves the same problem by refusing to add that layer. Comparing them is a category error — the designs disagree at the axiom level, not at the feature level.

@@ -1,12 +1,12 @@
 # The Wire
 
-Every message on the bus is two ZMQ frames: a fixed 256-byte header followed by an opaque payload.
+Every message on the bus is a single contiguous buffer: a fixed 256-byte header followed by an opaque payload. NNG pub/sub prefix-matches on the topic field at the start of the header.
 
 ## Header
 
 ```c
 typedef struct __attribute__((packed)) {
-    char     topic[32];          // ZMQ subscription filter
+    char     topic[32];          // subscription prefix — at offset 0 for NNG prefix match
     uint8_t  id[16];             // uuidv7 binary — monotonic, time-ordered
     uint8_t  correlation_id[16]; // stable across entire causal chain
     uint8_t  causation_id[16];   // direct parent tuple id
@@ -20,12 +20,12 @@ typedef struct __attribute__((packed)) {
 ```
 
 ::: {.callout}
-**Zero copy.** The runtime casts the first ZMQ frame directly to `actor_header_t` — no allocation, no parsing, no branching. `__attribute__((packed))` guarantees layout. Cast and read.
+**Zero copy.** The runtime casts directly to `actor_header_t` from the NNG message body — no allocation, no parsing, no branching. `__attribute__((packed))` guarantees layout. Cast and read.
 :::
 
 ## Payload
 
-Frame 2 is **opaque bytes** up to 1 MB. The runtime never inspects it. Handlers negotiate their own encoding — MessagePack, Protobuf, raw text — without any runtime change.
+The bytes after the header are **opaque** up to 1 MB. The runtime never inspects them. Handlers negotiate their own encoding — MessagePack, Protobuf, raw text — without any runtime change.
 
 ## Causal chain
 

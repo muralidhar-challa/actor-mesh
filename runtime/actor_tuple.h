@@ -3,9 +3,10 @@
  * Fixed binary header for every tuple on the mesh.
  * No serialization library. Cast and read.
  *
- * Wire format:
+ * Wire format (single contiguous buffer):
  *   [ actor_header_t 256 bytes ][ payload bytes ]
  *
+ * NNG sub0 prefix-matches on topic[32] at offset 0.
  * Payload is opaque bytes. Runtime never inspects it.
  * Handler receives only payload. Handler emits only payload.
  * Runtime owns the header completely.
@@ -18,13 +19,14 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
 /* ── Header ──────────────────────────────────────────────────────────────── */
 
 typedef struct __attribute__((packed)) {
-    char     topic[32];           /* ZMQ subscription filter             */
+    char     topic[32];           /* subscription prefix (at offset 0)   */
     uint8_t  id[16];              /* uuidv7 binary                       */
     uint8_t  correlation_id[16];  /* trace chain end to end              */
     uint8_t  causation_id[16];    /* direct parent tuple id              */
@@ -60,8 +62,8 @@ static inline void actor_tuple_init(actor_header_t*  h,
                                     const uint8_t*   causation_id,
                                     uint32_t         payload_len) {
     memset(h, 0, sizeof(actor_header_t));
-    strncpy(h->topic,  topic,  sizeof(h->topic)  - 1);
-    strncpy(h->origin, origin, sizeof(h->origin) - 1);
+    snprintf(h->topic,  sizeof(h->topic),  "%s", topic);
+    snprintf(h->origin, sizeof(h->origin), "%s", origin);
     if (correlation_id) memcpy(h->correlation_id, correlation_id, 16);
     if (causation_id)   memcpy(h->causation_id,   causation_id,   16);
     h->payload_len = payload_len;

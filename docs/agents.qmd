@@ -131,7 +131,7 @@ The `correlation_id` in the tuple header is the shared key — tokenise and deto
 
 Entities are mapped to label-aware tokens like `TOK_PERSON_0001`, `TOK_ORG_0000`. The label gives the LLM entity-type context without revealing the value. The system prompt instructs the LLM to pass tokens through **verbatim** — never modify, truncate, or interpret them.
 
-### ZMQ Subscription Guard
+### Topic Matching
 
 Topics are designed to prevent prefix-match loops: `user_message` and `user_message_masked` differ at the 13th byte (null vs underscore). Subscriptions include the null terminator (`strlen(topic) + 1`) to ensure exact matching, never prefix.
 

@@ -5,10 +5,10 @@
  *
  * Required env:
  *   ACTOR_ID            unique actor instance id
- *   ACTOR_TOPIC         ZMQ subscription topic
+ *   ACTOR_TOPIC         subscription topic (comma-separated)
  *   ACTOR_RESULT_TOPIC  topic stamped on result tuples
- *   ACTOR_BUS_SUB       ZMQ XPUB endpoint  e.g. tcp://bus:5556
- *   ACTOR_BUS_PUB       ZMQ XSUB endpoint  e.g. tcp://bus:5557
+ *   ACTOR_BUS_SUB       NNG pub endpoint    e.g. tcp://bus:5556
+ *   ACTOR_BUS_PUB       NNG sub endpoint    e.g. tcp://bus:5557
  *   ACTOR_HANDLER       handler command     e.g. /handlers/agent.sh
  *   ACTOR_LMDB_PATH     LMDB directory path e.g. /var/actor/lmdb
  *

@@ -6,10 +6,18 @@ The employee mesh is a working ReAct agent: a natural language question arrives,
 
 ```sh
 # Debian/Ubuntu
-sudo apt install libzmq3-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev libncursesw5-dev
+sudo apt install libnng-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev libncursesw5-dev
 
 # Fedora/RHEL
-sudo dnf install zeromq-devel lmdb-devel libcurl-devel sqlite-devel ncurses-devel
+sudo dnf install nng-devel lmdb-devel libcurl-devel sqlite-devel ncurses-devel
+```
+
+If your distro doesn't package nng, vendor it:
+
+```sh
+git submodule add https://github.com/nanomsg/nng.git vendor/nng
+cd vendor/nng && mkdir build && cd build && cmake .. && make -j$(nproc)
+# add -Ivendor/nng/include -Lvendor/nng/build to CFLAGS/LIBS
 ```
 
 An OpenAI-compatible LLM API (DeepSeek, OpenAI, or local Ollama):
@@ -60,7 +68,7 @@ This produces:
 
 ```
 actor                  — runtime binary
-zmq-proxy              — bus proxy (74 lines)
+proxy                  — bus proxy (~57 lines)
 examples/employee-mesh/
   client               — CLI query tool
   tui                  — ncurses chat interface
@@ -81,7 +89,7 @@ This starts 5 processes:
 
 | Process | Topic subscription | Role |
 |---------|-------------------|------|
-| `zmq-proxy` | — | Bus fanout (:5556/:5557) |
+| `proxy` | — | Bus fanout (:5556/:5557) |
 | `tokenise-1` | `user_message`, `sql_result` | Mask PII before LLM |
 | `detokenise-1` | `sql_query_masked`, `agent_response_masked` | Restore PII after LLM |
 | `sqlite-tool-1` | `sql_query` | Execute SQL |
@@ -164,6 +172,4 @@ TOKENMAP_PATH=/tmp/actor-mesh/tokenmap
 
 **Client times out** — the ReAct loop can take 30-90 seconds with a local model. The client has a 10-minute timeout. For Ollama, check it is running: `curl http://localhost:11434/api/tags`. For remote APIs, verify your key with `curl https://api.deepseek.com/v1/models -H "Authorization: Bearer $LLM_API_KEY"`.
 
-**Port already in use** — `make stop` or `pkill zmq-proxy` to free ports 5556/5557.
-
-**Tokens not restoring** — the client must use the null-terminator fix for ZMQ subscriptions. Current code includes this; older builds may not.
+**Port already in use** — `make stop` or `pkill proxy` to free ports 5556/5557.

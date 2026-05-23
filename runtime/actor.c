@@ -2,7 +2,7 @@
 /* actor.c — generic actor runtime
  *
  * Zero malloc. Fixed static buffers. Capped payload.
- * Loop: poll ZMQ → check TTL → write inbox LMDB → fork handler
+ * Loop: poll NNG → check TTL → write inbox LMDB → fork handler
  *       → write payload stdin → read result stdout → build result header
  *       → write outbox LMDB → publish → clear LMDB
  *
@@ -24,7 +24,10 @@
 #include <time.h>
 #include <sys/wait.h>
 
-#include <zmq.h>
+#include <nng/nng.h>
+#include <nng/protocol/pubsub0/pub.h>
+#include <nng/protocol/pubsub0/sub.h>
+
 #include <lmdb.h>
 
 /* ── Payload cap ─────────────────────────────────────────────────────────── */
@@ -43,7 +46,7 @@
 /* g_result_buf: handler stdout is read into here — fixed, never grows */
 static uint8_t g_result_buf[ACTOR_MAX_PAYLOAD];
 
-/* g_frame_buf: header + payload assembled here for LMDB writes */
+/* g_frame_buf: header + payload assembled here for LMDB writes and NNG sends */
 static uint8_t g_frame_buf[ACTOR_MAX_FRAME];
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
@@ -96,13 +99,12 @@ static int cfg_load(void) {
 
 /* ── State ───────────────────────────────────────────────────────────────── */
 
-static void*    zmq_ctx;
-static void*    zmq_pub;
-static void*    zmq_sub;
-static MDB_env* mdb_env;
-static MDB_dbi  dbi_inbox;
-static MDB_dbi  dbi_outbox;
-static MDB_dbi  dbi_state;
+static nng_socket nng_pub;
+static nng_socket nng_sub;
+static MDB_env*   mdb_env;
+static MDB_dbi    dbi_inbox;
+static MDB_dbi    dbi_outbox;
+static MDB_dbi    dbi_state;
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -110,34 +112,50 @@ static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
-/* ── ZMQ ─────────────────────────────────────────────────────────────────── */
+/* ── NNG ─────────────────────────────────────────────────────────────────── */
 
-static int zmq_setup(void) {
-    zmq_ctx = zmq_ctx_new();
-    if (!zmq_ctx) return -1;
+static int nng_setup(void) {
+    int rc;
 
-    zmq_pub = zmq_socket(zmq_ctx, ZMQ_PUB);
-    if (zmq_connect(zmq_pub, cfg.bus_pub) < 0) {
-        fprintf(stderr, "[actor] pub connect failed: %s\n", zmq_strerror(errno));
+    if ((rc = nng_pub0_open(&nng_pub)) != 0) {
+        fprintf(stderr, "[actor] nng_pub0_open: %s\n", nng_strerror(rc));
+        return -1;
+    }
+    if ((rc = nng_dial(nng_pub, cfg.bus_pub, NULL, 0)) != 0) {
+        fprintf(stderr, "[actor] pub dial %s: %s\n", cfg.bus_pub, nng_strerror(rc));
         return -1;
     }
 
-    zmq_sub = zmq_socket(zmq_ctx, ZMQ_SUB);
-    if (zmq_connect(zmq_sub, cfg.bus_sub) < 0) {
-        fprintf(stderr, "[actor] sub connect failed: %s\n", zmq_strerror(errno));
+    if ((rc = nng_sub0_open(&nng_sub)) != 0) {
+        fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
+        return -1;
+    }
+    if ((rc = nng_dial(nng_sub, cfg.bus_sub, NULL, 0)) != 0) {
+        fprintf(stderr, "[actor] sub dial %s: %s\n", cfg.bus_sub, nng_strerror(rc));
         return -1;
     }
 
-    /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result" */
+    /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result"
+     * NNG sub0 does prefix matching on the message body. The topic field
+     * is at offset 0 of actor_header_t, so subscribe with null-terminated
+     * topic string for exact (non-prefix) match. */
     char topic_buf[256];
     strncpy(topic_buf, cfg.topic, sizeof(topic_buf) - 1);
     topic_buf[sizeof(topic_buf) - 1] = '\0';
     char *saveptr; char* tok = strtok_r(topic_buf, ",", &saveptr);
     while (tok) {
         while (*tok == ' ') tok++;
-        zmq_setsockopt(zmq_sub, ZMQ_SUBSCRIBE, tok, strlen(tok) + 1);
+        size_t tlen = strlen(tok) + 1;  /* include null for exact match */
+        if ((rc = nng_socket_set(nng_sub, NNG_OPT_SUB_SUBSCRIBE, tok, tlen)) != 0) {
+            fprintf(stderr, "[actor] sub subscribe %s: %s\n", tok, nng_strerror(rc));
+            return -1;
+        }
         tok = strtok_r(NULL, ",", &saveptr);
     }
+
+    /* set recv timeout for heartbeat check granularity (100ms) */
+    nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100);
+
     return 0;
 }
 
@@ -327,13 +345,14 @@ static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
     actor_uuid_gen(out_hdr.id);
     out_hdr.ttl = cfg.ttl_ns;
 
+    /* assemble header + payload into frame buffer, write to LMDB outbox */
     size_t frame_len = sizeof(actor_header_t) + payload_len;
     memcpy(g_frame_buf, &out_hdr, sizeof(actor_header_t));
     memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
     lmdb_put(dbi_outbox, out_hdr.id, 16, g_frame_buf, frame_len);
 
-    zmq_send(zmq_pub, &out_hdr, sizeof(actor_header_t), ZMQ_SNDMORE);
-    zmq_send(zmq_pub, payload,  payload_len,             0);
+    /* publish as single contiguous message — NNG sub0 prefix-matches on topic */
+    nng_send(nng_pub, g_frame_buf, frame_len, 0);
 
     lmdb_del(dbi_outbox, out_hdr.id, 16);
 }
@@ -353,8 +372,11 @@ static void emit_heartbeat(void) {
     actor_uuid_gen(hdr.id);
     hdr.ttl = (int64_t)cfg.heartbeat_ms * 3 * 1000000LL;
 
-    zmq_send(zmq_pub, &hdr,    sizeof(actor_header_t), ZMQ_SNDMORE);
-    zmq_send(zmq_pub, payload, plen,                   0);
+    /* assemble header + payload into frame buffer and send */
+    size_t frame_len = sizeof(actor_header_t) + plen;
+    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
+    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, g_frame_buf, frame_len, 0);
 }
 
 /* ── Process one tuple ───────────────────────────────────────────────────── */
@@ -420,15 +442,11 @@ int actor_run(void) {
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 
-    if (zmq_setup()  < 0) return -1;
+    if (nng_setup()  < 0) return -1;
     if (lmdb_setup() < 0) return -1;
 
     fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d\n",
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD);
-
-    zmq_pollitem_t items[1];
-    items[0].socket = zmq_sub;
-    items[0].events = ZMQ_POLLIN;
 
     int64_t last_hb = 0;
 
@@ -444,52 +462,45 @@ int actor_run(void) {
             }
         }
 
-        int rc = zmq_poll(items, 1, 100);
-        if (rc < 0) break;
-        if (rc == 0) continue;
+        /* receive with 100ms timeout — unblocks for heartbeat check */
+        nng_msg* msg = NULL;
+        int rc = nng_recvmsg(nng_sub, &msg, 0);
+        if (rc == NNG_ETIMEDOUT) {
+            continue;
+        }
+        if (rc != 0) {
+            if (g_stop) break;
+            fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
+            break;
+        }
 
-        /* receive header frame */
-        zmq_msg_t hdr_msg;
-        zmq_msg_init(&hdr_msg);
-        zmq_msg_recv(&hdr_msg, zmq_sub, 0);
+        void*  body      = nng_msg_body(msg);
+        size_t body_len  = nng_msg_len(msg);
 
-        if (zmq_msg_size(&hdr_msg) < sizeof(actor_header_t)) {
-            fprintf(stderr, "[actor] short frame, dropping\n");
-            zmq_msg_close(&hdr_msg);
+        if (body_len < sizeof(actor_header_t)) {
+            fprintf(stderr, "[actor] short message %zu bytes, dropping\n", body_len);
+            nng_msg_free(msg);
             continue;
         }
 
-        const actor_header_t* hdr = zmq_msg_data(&hdr_msg);
-
-        /* receive payload frame */
-        zmq_msg_t pay_msg;
-        zmq_msg_init(&pay_msg);
-        if (zmq_msg_more(&hdr_msg)) {
-            zmq_msg_recv(&pay_msg, zmq_sub, 0);
-        }
+        const actor_header_t* hdr         = (const actor_header_t*)body;
+        const uint8_t*        payload     = (const uint8_t*)body + sizeof(actor_header_t);
+        size_t                payload_len = body_len - sizeof(actor_header_t);
 
         /* TTL check */
         if (actor_tuple_expired(hdr)) {
             fprintf(stderr, "[actor] tuple expired, dropping (topic=%.32s)\n", hdr->topic);
-            zmq_msg_close(&hdr_msg);
-            zmq_msg_close(&pay_msg);
+            nng_msg_free(msg);
             continue;
         }
 
-        /* zero copy — payload pointer direct from ZMQ buffer */
-        const uint8_t* payload     = zmq_msg_data(&pay_msg);
-        size_t         payload_len = zmq_msg_size(&pay_msg);
-
         process_tuple(hdr, payload, payload_len);
-
-        zmq_msg_close(&hdr_msg);
-        zmq_msg_close(&pay_msg);
+        nng_msg_free(msg);
     }
 
     fprintf(stderr, "[actor] shutting down\n");
-    zmq_close(zmq_pub);
-    zmq_close(zmq_sub);
-    zmq_ctx_destroy(zmq_ctx);
+    nng_close(nng_pub);
+    nng_close(nng_sub);
     mdb_env_close(mdb_env);
     return 0;
 }

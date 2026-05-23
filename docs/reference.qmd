@@ -11,8 +11,8 @@ static uint8_t g_frame_buf[ACTOR_MAX_PAYLOAD + sizeof(actor_header_t)];
 
 | Component | Idle RSS | Detail |
 |---|---|---|
-| `zmq-proxy` | ~8 MB | ZMQ socket buffers only |
-| actor runtime | ~8 MB | ZMQ + LMDB mmap + payload BSS |
+| `proxy` | ~4 MB | NNG socket buffers only |
+| actor runtime | ~8 MB | NNG + LMDB mmap + payload BSS |
 | handler invocation | ~4 MB peak | Static BSS + shared libs; exits immediately |
 
 A payload exceeding the cap is dropped with a log message — never `malloc`. Override at build time:
@@ -34,4 +34,3 @@ make ACTOR_MAX_PAYLOAD=4194304
 | Composable | Adding an actor to a running mesh requires zero changes to existing actors. Subscribe to a topic, emit on a topic, done. |
 
 ---
-

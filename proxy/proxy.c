@@ -1,74 +1,57 @@
-/* proxy.c — ZMQ XPUB/XSUB dumb fanout proxy
- *
- * No logic. No routing. Just moves bytes.
- * All actors connect here.
- *
- * Env:
- *   PROXY_XSUB_BIND   actors publish here    e.g. tcp-star-5557
- *   PROXY_XPUB_BIND   actors subscribe here  e.g. tcp-star-5556
- *   PROXY_COMPRESS    zlib | zstd | none (default none)
- *                     Note: requires libzmq built with compression support.
- *                     Standard distro builds default to none.
- *                     Alternatively handle compression at the actor layer.
- */
+// proxy.c — NNG pub/sub dumb fanout proxy
+//
+// No logic. No routing. Just moves bytes.
+// All actors connect here.
+//
+// Env:
+//   PROXY_SUB_BIND   where publishers dial  (default tcp://*:5557)
+//   PROXY_PUB_BIND   where subscribers dial  (default tcp://*:5556)
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <zmq.h>
-
-/* ZMQ compression constants — defined in libzmq >= 4.3 custom builds.
- * Guard with ifdef so the binary still compiles on standard distro libzmq. */
-#ifndef ZMQ_COMPRESS
-#  define ZMQ_COMPRESS       86
-#  define ZMQ_COMPRESS_NONE  0
-#  define ZMQ_COMPRESS_ZLIB  1
-#  define ZMQ_COMPRESS_ZSTD  2
-#endif
-
-static void set_compress(void* sock, int method, const char* label) {
-    int rc = zmq_setsockopt(sock, ZMQ_COMPRESS, &method, sizeof(method));
-    if (rc != 0) {
-        fprintf(stderr, "[proxy] compression=%s not supported by this libzmq build"
-                        " — running without compression\n", label);
-    } else {
-        fprintf(stderr, "[proxy] compression=%s\n", label);
-    }
-}
+#include <nng/nng.h>
+#include <nng/protocol/pubsub0/pub.h>
+#include <nng/protocol/pubsub0/sub.h>
 
 int main(void) {
-    const char* xsub_bind = getenv("PROXY_XSUB_BIND");
-    const char* xpub_bind = getenv("PROXY_XPUB_BIND");
-    const char* compress  = getenv("PROXY_COMPRESS");
+    const char* sub_bind = getenv("PROXY_SUB_BIND");
+    const char* pub_bind = getenv("PROXY_PUB_BIND");
 
-    if (!xsub_bind) xsub_bind = "tcp://*:5557";
-    if (!xpub_bind) xpub_bind = "tcp://*:5556";
-    if (!compress)  compress  = "none";
+    if (!sub_bind) sub_bind = "tcp://*:5557";
+    if (!pub_bind) pub_bind = "tcp://*:5556";
 
-    void* ctx  = zmq_ctx_new();
-    void* xsub = zmq_socket(ctx, ZMQ_XSUB);
-    void* xpub = zmq_socket(ctx, ZMQ_XPUB);
+    nng_socket sub, pub;
+    int        rc;
 
-    if (strcmp(compress, "zlib") == 0) {
-        set_compress(xsub, ZMQ_COMPRESS_ZLIB, "zlib");
-        set_compress(xpub, ZMQ_COMPRESS_ZLIB, "zlib");
-    } else if (strcmp(compress, "zstd") == 0) {
-        set_compress(xsub, ZMQ_COMPRESS_ZSTD, "zstd");
-        set_compress(xpub, ZMQ_COMPRESS_ZSTD, "zstd");
-    } else {
-        fprintf(stderr, "[proxy] compression=none\n");
+    if ((rc = nng_sub0_open_raw(&sub)) != 0) {
+        fprintf(stderr, "[proxy] nng_sub0_open_raw: %s\n", nng_strerror(rc));
+        return 1;
+    }
+    if ((rc = nng_pub0_open_raw(&pub)) != 0) {
+        fprintf(stderr, "[proxy] nng_pub0_open: %s\n", nng_strerror(rc));
+        nng_close(sub);
+        return 1;
     }
 
-    zmq_bind(xsub, xsub_bind);
-    zmq_bind(xpub, xpub_bind);
+    if ((rc = nng_listen(sub, sub_bind, NULL, 0)) != 0) {
+        fprintf(stderr, "[proxy] sub listen %s: %s\n", sub_bind, nng_strerror(rc));
+        nng_close(pub);
+        nng_close(sub);
+        return 1;
+    }
+    if ((rc = nng_listen(pub, pub_bind, NULL, 0)) != 0) {
+        fprintf(stderr, "[proxy] pub listen %s: %s\n", pub_bind, nng_strerror(rc));
+        nng_close(pub);
+        nng_close(sub);
+        return 1;
+    }
 
-    fprintf(stderr, "[proxy] xsub=%s xpub=%s\n", xsub_bind, xpub_bind);
+    fprintf(stderr, "[proxy] sub=%s pub=%s\n", sub_bind, pub_bind);
 
-    /* blocks forever — OS kills on SIGTERM */
-    zmq_proxy(xsub, xpub, NULL);
+    /* blocks forever — sub → pub forwarding, OS kills on SIGTERM */
+    nng_device(sub, pub);
 
-    zmq_close(xsub);
-    zmq_close(xpub);
-    zmq_ctx_destroy(ctx);
+    nng_close(pub);
+    nng_close(sub);
     return 0;
 }

@@ -7,7 +7,7 @@ sequenceDiagram
   participant A as actor A
   participant B as actor B
   participant C as client
-  participant BUS as XSUB / XPUB proxy
+  participant BUS as pub/sub proxy
   participant X as actor X
   participant Y as actor Y
   participant Z as actor Z
@@ -31,21 +31,23 @@ A message published on topic `orders` reaches every subscriber of `orders` — i
 **The proxy is not a broker.** It holds no queues, makes no routing decisions, and persists nothing. It is a wire junction. Durability, ordering, and acknowledgement are concerns of the actors themselves.
 :::
 
-## Backpressure
+## How it works
 
-ZMQ sockets have a built-in **high water mark** (HWM) — a hard ceiling on the number of messages queued in memory. When a slow subscriber falls behind, its queue fills to the HWM and ZMQ starts dropping messages on the publisher side rather than buffering without bound.
-
-This is not a failure mode — it is a design decision. The mesh trades delivery guarantee for bounded memory. Durability is the actor's responsibility via LMDB, not the bus's. A tuple dropped at the bus is a tuple the actor never wrote to its inbox, which means it was never processed and never committed. No partial state, no corruption.
+The proxy is a single NNG device — a sub0 socket forward to a pub0 socket via `nng_device()`. Publishers dial the sub port, subscribers dial the pub port. NNG's pub0/sub0 does prefix matching on the message body, which begins with the `topic[32]` field of the tuple header. Subscriber-side filtering means every actor sees every message on the wire and drops what it isn't subscribed to — a single `memcmp` per message.
 
 ::: {.callout}
-**The proxy holds no queues of its own.** HWM applies to the per-socket buffers inside ZMQ. The proxy itself is stateless — it is a forwarding junction, not a store. A crashed proxy loses nothing; actors reconnect and continue.
+**Topic-level isolation** is achieved by encrypting sensitive payloads. The topic field is public — anyone on the bus can see that a message on topic `sql_query` was sent. But the payload bytes are opaque and can be encrypted end-to-end between the publishing actor and the intended handler.
 :::
+
+## The proxy is an actor
+
+The proxy binary is a full actor skeleton — it has its own LMDB environment for routing state when needed. By default it runs in dumb forwarding mode (`nng_device`), but it can also run a handler to do subscription-aware routing using LMDB as a topic trie. Catch-up after restart works the same way: an actor publishes a request to the proxy, the proxy walks its LMDB cursor and streams back missed tuples.
 
 ## Endpoints
 
-The proxy is 74 lines of C. It binds two ZMQ sockets and forwards between them:
+The proxy is ~57 lines of C. It binds two NNG sockets and forwards between them:
 
-- **XSUB** on `tcp://*:5557` — actors publish here
-- **XPUB** on `tcp://*:5556` — actors subscribe here
+- **sub** on `tcp://*:5557` — actors publish here
+- **pub** on `tcp://*:5556` — actors subscribe here
 
-Both endpoints are configurable via `PROXY_XSUB_BIND` and `PROXY_XPUB_BIND`.
+Both endpoints are configurable via `PROXY_SUB_BIND` and `PROXY_PUB_BIND`.

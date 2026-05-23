@@ -20,10 +20,10 @@ The difference: C native, zero framework, same binary from edge to cloud.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ACTOR_ID` | yes  | — | Unique instance id |
-| `ACTOR_TOPIC` | yes  | — | ZMQ subscription topic (comma-separated) |
+| `ACTOR_TOPIC` | yes  | — | Subscription topic (comma-separated) |
 | `ACTOR_RESULT_TOPIC` | yes  | — | Default publish topic |
-| `ACTOR_BUS_SUB` | yes  | — | ZMQ XPUB endpoint e.g. `tcp://bus:5556` |
-| `ACTOR_BUS_PUB` | yes  | — | ZMQ XSUB endpoint e.g. `tcp://bus:5557` |
+| `ACTOR_BUS_SUB` | yes  | — | NNG pub endpoint e.g. `tcp://bus:5556` |
+| `ACTOR_BUS_PUB` | yes  | — | NNG sub endpoint e.g. `tcp://bus:5557` |
 | `ACTOR_HANDLER` | yes  | — | Handler binary path (or shell command) |
 | `ACTOR_LMDB_PATH` | yes  | — | LMDB directory path |
 | `ACTOR_TTL_NS` | no  | 0 | Default tuple TTL in nanoseconds |
@@ -35,9 +35,8 @@ The difference: C native, zero framework, same binary from edge to cloud.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROXY_XSUB_BIND` | `tcp://*:5557` | Actors publish here |
-| `PROXY_XPUB_BIND` | `tcp://*:5556` | Actors subscribe here |
-| `PROXY_COMPRESS` | `none` | `zlib`, `zstd`, or `none` |
+| `PROXY_SUB_BIND` | `tcp://*:5557` | Actors publish here |
+| `PROXY_PUB_BIND` | `tcp://*:5556` | Actors subscribe here |
 
 ### Handler Env Vars (inherited from actor)
 
@@ -87,6 +86,8 @@ The difference: C native, zero framework, same binary from edge to cloud.
 **Dedup** — Duplicate delivery prevention. Handlers write the `ACTOR_TUPLE_ID` into an LMDB database with `MDB_NOOVERWRITE`. If the key already exists, the handler exits silently.
 
 **ReAct** — Reason + Act. The agentic loop pattern: think about what to do, call a tool, observe the result, repeat. On the mesh this is a message flow, not control flow.
+
+**NNG** — nanomsg-next-generation. A lightweight C messaging library. Replaces ZeroMQ as the transport layer. Provides pub/sub, push/pull, req/rep, and raw socket patterns with pluggable transports (TCP, IPC, TLS, WebSocket, ZeroTier).
 
 > The runtime does not know what a message means.  
 > The handler does not know where the message came from.  

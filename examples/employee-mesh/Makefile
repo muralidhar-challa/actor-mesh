@@ -11,8 +11,8 @@
 #
 # ── Prerequisites ──────────────────────────────────────────────────────────
 #   Build runtime first:  cd ../.. && make
-#   Deps: libzmq3-dev liblmdb-dev libcurl-devel sqlite3-devel
-#   Ollama running locally
+#   Deps: libnng-dev liblmdb-dev libcurl-devel sqlite3-devel
+#   Or vendor nng:         git submodule add https://github.com/nanomsg/nng.git vendor/nng
 
 ROOT    = ../..
 RUNTIME = $(ROOT)/runtime
@@ -21,7 +21,7 @@ VENDOR  = $(ROOT)/vendor
 CC           = gcc
 CXX          = g++
 CFLAGS       = -Wall -Wextra -O2 -std=c11 -I$(RUNTIME) -I$(VENDOR)/mpack/src/mpack -I$(ROOT)
-LIBS         = -lzmq -llmdb
+LIBS         = -lnng -llmdb
 HANDLER_LIBS = -lcurl -llmdb -lsqlite3
 
 NER_MODEL    ?= $(abspath ../../models/ner.onnx)
@@ -40,7 +40,7 @@ MPACK_SRCS = \
 CJSON = $(VENDOR)/cjson/cJSON.c
 
 ACTOR  = $(ROOT)/actor
-PROXY  = $(ROOT)/zmq-proxy
+PROXY  = $(ROOT)/mesh-proxy
 
 # ── Build ──────────────────────────────────────────────────────────────────
 
@@ -77,10 +77,10 @@ EMPLOYEE_DB  ?= $(abspath db/employee.db)
 
 # ── Bus ────────────────────────────────────────────────────────────────────
 
-PROXY_XSUB_BIND ?= tcp://*:5557
-PROXY_XPUB_BIND ?= tcp://*:5556
-BUS_SUB         ?= tcp://localhost:5556
-BUS_PUB         ?= tcp://localhost:5557
+PROXY_SUB_BIND ?= tcp://*:5557
+PROXY_PUB_BIND ?= tcp://*:5556
+BUS_SUB        ?= tcp://localhost:5556
+BUS_PUB        ?= tcp://localhost:5557
 
 # ── LLM (OpenAI-compatible: DeepSeek, OpenAI, etc.) ───────────────────────
 
@@ -99,15 +99,15 @@ COMMON_ENV = \
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent run-tokenise run-detokenise query chat
+.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent run-tokenise run-detokenise run-shell-exec query chat
 
 run: run-proxy run-tokenise run-detokenise run-sqlite-tool run-llm-agent
 	@echo "[mesh] employee mesh running (PII tokenisation enabled)"
 	@echo "[mesh] try: make query Q=\"list all engineers\""
 
 stop:
-	@pkill -9 zmq-proxy || true
-	@pkill -9 actor     || true
+	@pkill -9 mesh-proxy || true
+	@pkill -9 actor || true
 	@rm -rf $(LMDB_BASE)
 	@echo "[mesh] stopped  (logs were in $(LOGDIR))"
 
@@ -115,8 +115,8 @@ LOGDIR ?= /tmp/actor-mesh/logs
 
 run-proxy:
 	@mkdir -p $(LMDB_BASE) $(LOGDIR) $(TOKENMAP_PATH)
-	@PROXY_XSUB_BIND=$(PROXY_XSUB_BIND) \
-	PROXY_XPUB_BIND=$(PROXY_XPUB_BIND) \
+	@PROXY_SUB_BIND=$(PROXY_SUB_BIND) \
+	PROXY_PUB_BIND=$(PROXY_PUB_BIND) \
 	$(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
 	@sleep 0.2
 	@echo "[proxy] started  (log: $(LOGDIR)/proxy.log)"
@@ -174,6 +174,19 @@ run-detokenise:
 	TOKENMAP_PATH=$(TOKENMAP_PATH) \
 	$(ACTOR) >>$(LOGDIR)/detokenise.log 2>&1 &
 	@echo "[actor] detokenise started  (log: $(LOGDIR)/detokenise.log)"
+
+# ── Shell Exec ────────────────────────────────────────────────────────────
+
+run-shell-exec:
+	@mkdir -p $(LMDB_BASE)/shell-exec $(LOGDIR)
+	@$(COMMON_ENV) \
+	ACTOR_ID=shell-exec-1 \
+	ACTOR_TOPIC=shell_exec \
+	ACTOR_RESULT_TOPIC=shell_result \
+	ACTOR_HANDLER=$(abspath handlers/shell-exec) \
+	ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
+	$(ACTOR) >>$(LOGDIR)/shell-exec.log 2>&1 &
+	@echo "[actor] shell-exec started  (log: $(LOGDIR)/shell-exec.log)"
 
 # ── Query / Chat ───────────────────────────────────────────────────────────
 

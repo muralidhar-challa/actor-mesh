@@ -5,7 +5,7 @@
 A minimal distributed actor mesh built on Unix primitives.
 No frameworks. No sidecars. No brokers. Just processes.
 
-The runtime is ~500 lines of C. The proxy is 74 lines of C.
+The runtime is ~506 lines of C. The proxy is ~57 lines of C.
 A handler is any process that speaks stdio.
 
 ---
@@ -29,10 +29,10 @@ One binary. Config and handler define behaviour.
 
 ```
 ┌──────────────────────────────────────────────────┐
-│                  ZMQ Proxy                       │
-│   XSUB — collects published tuples               │
-│   XPUB — fans out to subscribers                 │
-│   HWM  — backpressure built in                   │
+│                  NNG Proxy                       │
+│   sub0 ← collects published messages             │
+│   pub0 → fans out to subscribers                 │
+│   nng_device(sub, pub) — dumb forwarding         │
 └───────────────────┬──────────────────────────────┘
                     │  tcp://
           ┌─────────┼─────────┐
@@ -42,7 +42,7 @@ One binary. Config and handler define behaviour.
 ```
 
 Each actor:
-- Connects to proxy via ZMQ SUB (receive) and PUB (send)
+- Connects to proxy via NNG pub0 (publish) and sub0 (subscribe)
 - Forks a handler process per tuple
 - Writes payload to handler stdin
 - Reads result from handler stdout
@@ -54,10 +54,11 @@ Each actor:
 ## Tuple Header
 
 Fixed 256-byte binary header. No serialisation library. Cast and read — zero copy.
+The header is followed directly by payload bytes in a single contiguous buffer.
 
 ```c
 typedef struct __attribute__((packed)) {
-    char     topic[32];           // ZMQ subscription filter
+    char     topic[32];           // NNG subscription prefix (at offset 0)
     uint8_t  id[16];              // uuidv7 binary
     uint8_t  correlation_id[16];  // trace chain end to end
     uint8_t  causation_id[16];    // direct parent tuple id
@@ -155,21 +156,21 @@ int main(void) {
 
 ```
 1. Read config from environment
-2. Connect ZMQ SUB + PUB to proxy
+2. Connect NNG pub0 + sub0 to proxy
 3. Open LMDB
 4. Enter poll loop:
    a. Emit heartbeat every ACTOR_HEARTBEAT_MS
-   b. Poll ZMQ (100ms timeout)
-   c. Receive header frame
-   d. Check TTL — drop if expired
-   e. Receive payload frame
+   b. NNG recvmsg (100ms timeout)
+   c. Receive header + payload as single buffer
+   d. Cast to actor_header_t (zero copy)
+   e. Check TTL — drop if expired
    f. Write frame to LMDB inbox (durability)
    g. Set header env vars, fork handler
    h. Write payload to handler stdin
    i. Read result into static buffer (capped at ACTOR_MAX_PAYLOAD)
    j. Build result header (carry correlation chain)
    k. Write result frame to LMDB outbox
-   l. Publish result to ZMQ bus
+   l. Publish result to NNG bus
    m. Clear LMDB inbox + outbox
 5. On SIGTERM — drain and exit
 ```
@@ -253,10 +254,10 @@ Payload cap exceeded → drop immediately, no retry.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ACTOR_ID` | ✅ | — | Unique instance id |
-| `ACTOR_TOPIC` | ✅ | — | ZMQ subscription topic (comma-sep for multi) |
+| `ACTOR_TOPIC` | ✅ | — | Subscription topic (comma-sep for multi) |
 | `ACTOR_RESULT_TOPIC` | ✅ | — | Default topic stamped on result tuples |
-| `ACTOR_BUS_SUB` | ✅ | — | ZMQ XPUB endpoint e.g. `tcp://bus:5556` |
-| `ACTOR_BUS_PUB` | ✅ | — | ZMQ XSUB endpoint e.g. `tcp://bus:5557` |
+| `ACTOR_BUS_SUB` | ✅ | — | NNG pub endpoint e.g. `tcp://bus:5556` |
+| `ACTOR_BUS_PUB` | ✅ | — | NNG sub endpoint e.g. `tcp://bus:5557` |
 | `ACTOR_HANDLER` | ✅ | — | Handler binary path |
 | `ACTOR_LMDB_PATH` | ✅ | — | LMDB directory path |
 | `ACTOR_TTL_NS` | ☐ | 0 | Default tuple TTL nanoseconds |
@@ -267,8 +268,8 @@ Proxy:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROXY_XSUB_BIND` | `tcp://*:5557` | Actors publish here |
-| `PROXY_XPUB_BIND` | `tcp://*:5556` | Actors subscribe here |
+| `PROXY_SUB_BIND` | `tcp://*:5557` | Actors publish here |
+| `PROXY_PUB_BIND` | `tcp://*:5556` | Actors subscribe here |
 
 ---
 
@@ -276,16 +277,16 @@ Proxy:
 
 ```
 actor-mesh/
-├── Makefile                    build actor + zmq-proxy
+├── Makefile                    build actor + proxy
 ├── DESIGN.md
 ├── runtime/
 │   ├── actor.h                 public API — actor_run()
-│   ├── actor.c                 runtime (~430 lines, zero malloc)
+│   ├── actor.c                 runtime (~506 lines, zero malloc)
 │   ├── actor_tuple.h           256-byte header + helpers
 │   ├── actor_uuid.h            uuidv7 single-header, no deps
 │   └── main.c                  12-line entrypoint
 ├── proxy/
-│   └── proxy.c                 ZMQ XPUB/XSUB fanout (74 lines)
+│   └── proxy.c                 NNG pub/sub fanout (~57 lines)
 ├── examples/
 │   └── employee-mesh/          HR Q&A demo (ReAct loop over SQLite)
 │       ├── Makefile            build + run + query
@@ -297,7 +298,8 @@ actor-mesh/
 │           └── employee.db     sample employee database
 └── vendor/
     ├── cjson/                  cJSON v1.7.18
-    └── mu_json/                mu_json — zero-alloc JSON parser
+    ├── mpack/                  MessagePack
+    └── smhasher/               MurmurHash
 ```
 
 ---
@@ -322,7 +324,7 @@ make stop
 
 **Bare process:**
 ```sh
-./zmq-proxy &
+./mesh-proxy &
 ACTOR_ID=sqlite-tool-1 \
 ACTOR_TOPIC=sql_query \
 ACTOR_RESULT_TOPIC=sql_result \
@@ -343,9 +345,9 @@ env:
   - name: ACTOR_RESULT_TOPIC
     value: sql_result
   - name: ACTOR_BUS_SUB
-    value: tcp://zmq-proxy:5556
+    value: tcp://proxy:5556
   - name: ACTOR_BUS_PUB
-    value: tcp://zmq-proxy:5557
+    value: tcp://proxy:5557
   - name: ACTOR_HANDLER
     value: /handlers/sqlite-tool
   - name: ACTOR_LMDB_PATH
