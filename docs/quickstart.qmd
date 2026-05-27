@@ -68,7 +68,7 @@ This produces:
 
 ```
 actor                  — runtime binary
-proxy                  — bus proxy (~57 lines)
+mesh-proxy             — bus proxy (~57 lines)
 examples/employee-mesh/
   client               — CLI query tool
   tui                  — ncurses chat interface
@@ -172,4 +172,4 @@ TOKENMAP_PATH=/tmp/actor-mesh/tokenmap
 
 **Client times out** — the ReAct loop can take 30-90 seconds with a local model. The client has a 10-minute timeout. For Ollama, check it is running: `curl http://localhost:11434/api/tags`. For remote APIs, verify your key with `curl https://api.deepseek.com/v1/models -H "Authorization: Bearer $LLM_API_KEY"`.
 
-**Port already in use** — `make stop` or `pkill proxy` to free ports 5556/5557.
+**Port already in use** — `make stop` or `pkill mesh-proxy` to free ports 5556/5557.
