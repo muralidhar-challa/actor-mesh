@@ -13,7 +13,12 @@
 set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-TARGET="${1:-native}"
+TARGET="native"
+case "${1:-}" in
+    --target) TARGET="$2"; shift 2 ;;
+    --target=*) TARGET="${1#*=}" ;;
+    native|*-*-*) TARGET="$1" ;;
+esac
 ZIG="${ZIG:-zig}"
 
 # --- config ---
@@ -72,6 +77,11 @@ if [ ! -f "$DEPS_DIR/libnng.a" ]; then
     fi
     mkdir -p "$NNG_BUILD"
     cd "$NNG_BUILD"
+    export CC="$ZIG cc"
+    export AR="$ZIG ar"
+    export RANLIB="$ZIG ranlib"
+    CFLAGS_CMAKE=""
+    [ "$TARGET" != "native" ] && CFLAGS_CMAKE="-target $TARGET"
     cmake "$NNG_SRC" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
@@ -91,10 +101,7 @@ if [ ! -f "$DEPS_DIR/libnng.a" ]; then
         -DNNG_ENABLE_TLS=OFF \
         -DNNG_TOOLS=OFF \
         -DNNG_TESTS=OFF \
-        -DCMAKE_C_COMPILER="$ZIG cc" \
-        $([ "$TARGET" != "native" ] && echo "-DCMAKE_C_FLAGS=-target $TARGET") \
-        -DCMAKE_AR="$ZIG ar" \
-        -DCMAKE_RANLIB="$ZIG ranlib"
+        -DCMAKE_C_FLAGS="$CFLAGS_CMAKE"
     make -j$(nproc) nng
     cp libnng.a "$DEPS_DIR/"
     echo "  -> $DEPS_DIR/libnng.a"
