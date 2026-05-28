@@ -24,6 +24,10 @@
 #include <time.h>
 #include <sys/wait.h>
 
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
 #include <nng/protocol/pubsub0/sub.h>
@@ -209,87 +213,166 @@ static size_t lmdb_count(MDB_dbi dbi) {
     return stat.ms_entries;
 }
 
-/* ── Handler ─────────────────────────────────────────────────────────────── */
+/* ── Handler spawn — cross-platform ──────────────────────────────────────── */
 
-/* invoke_handler forks the handler, writes payload to stdin,
- * reads result into g_result_buf (static, no malloc).
- * Returns result length, -1 on error, -2 if result exceeds cap. */
-static ssize_t invoke_handler(const actor_header_t* hdr,
-                              const uint8_t*        payload,
-                              size_t                payload_len) {
-    int to_handler[2];
-    int from_handler[2];
+/* platform_spawn launches the handler, pipes payload to its stdin,
+ * reads result from its stdout, returns the length or error.
+ * Unix: fork/exec   Windows: CreateProcess */
+#ifdef _WIN32
 
-    if (pipe(to_handler)   < 0) return -1;
-    if (pipe(from_handler) < 0) { close(to_handler[0]); close(to_handler[1]); return -1; }
+static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
+                              uint8_t*       out, size_t out_cap) {
+    HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
+    HANDLE stdout_rd = NULL, stdout_wr = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    ssize_t result = -1;
+
+    if (!CreatePipe(&stdin_rd,  &stdin_wr,  &sa, 0)) return -1;
+    if (!CreatePipe(&stdout_rd, &stdout_wr, &sa, 0)) goto fail_stdin;
+    SetHandleInformation(stdin_wr,  HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.hStdInput  = stdin_rd;
+    si.hStdOutput = stdout_wr;
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+
+    char cmdline[1024];
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cfg.handler);
+
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                        0, NULL, NULL, &si, &pi))
+        goto fail_stdout;
+
+    CloseHandle(stdin_rd);   stdin_rd  = NULL;
+    CloseHandle(stdout_wr);  stdout_wr = NULL;
+
+    DWORD written = 0;
+    if (!WriteFile(stdin_wr, in, (DWORD)in_len, &written, NULL) || written != in_len)
+        goto fail_proc;
+    CloseHandle(stdin_wr); stdin_wr = NULL;
+
+    size_t len = 0;
+    for (;;) {
+        DWORD n = 0;
+        if (!ReadFile(stdout_rd, out + len, (DWORD)(out_cap - len), &n, NULL) || n == 0)
+            break;
+        len += n;
+        if (len == out_cap) {
+            uint8_t drain[256]; DWORD d;
+            while (ReadFile(stdout_rd, drain, sizeof(drain), &d, NULL) && d > 0) {}
+            result = -2;
+            goto fail_proc;
+        }
+    }
+    result = (ssize_t)len;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD ec;
+    if (GetExitCodeProcess(pi.hProcess, &ec) && ec != 0) result = -1;
+
+fail_proc:
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+fail_stdout:
+    if (stdout_rd) CloseHandle(stdout_rd);
+    if (stdout_wr) CloseHandle(stdout_wr);
+fail_stdin:
+    if (stdin_rd)  CloseHandle(stdin_rd);
+    if (stdin_wr)  CloseHandle(stdin_wr);
+    return result;
+}
+
+#else /* Unix — fork/exec */
+
+static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
+                              uint8_t*       out, size_t out_cap) {
+    int to_child[2], from_child[2];
+
+    if (pipe(to_child)   < 0) return -1;
+    if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return -1; }
 
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        return -1;
+    }
 
     if (pid == 0) {
-        /* child — becomes the handler */
-        dup2(to_handler[0],   STDIN_FILENO);
-        dup2(from_handler[1], STDOUT_FILENO);
-        close(to_handler[0]);  close(to_handler[1]);
-        close(from_handler[0]); close(from_handler[1]);
-
-        /* expose header fields as env vars — read-only visibility for handler */
-        char id_hex[33], corr_hex[33], caus_hex[33], attempt_str[12];
-        actor_uuid_hex(hdr->id,             id_hex);
-        actor_uuid_hex(hdr->correlation_id, corr_hex);
-        actor_uuid_hex(hdr->causation_id,   caus_hex);
-        snprintf(attempt_str, sizeof(attempt_str), "%d", hdr->attempt);
-        setenv("ACTOR_TUPLE_ID",       id_hex,      1);
-        setenv("ACTOR_CORRELATION_ID", corr_hex,    1);
-        setenv("ACTOR_CAUSATION_ID",   caus_hex,    1);
-        setenv("ACTOR_TUPLE_ORIGIN",   hdr->origin, 1);
-        setenv("ACTOR_ATTEMPT",        attempt_str, 1);
-
+        dup2(to_child[0],   STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
         execl("/bin/sh", "sh", "-c", cfg.handler, NULL);
         _exit(1);
     }
 
-    /* parent */
-    close(to_handler[0]);
-    close(from_handler[1]);
+    close(to_child[0]);
+    close(from_child[1]);
 
-    /* write payload → handler stdin, signal EOF */
-    if (write(to_handler[1], payload, payload_len) < 0) {
-        close(to_handler[1]);
-        close(from_handler[0]);
+    if (write(to_child[1], in, in_len) < 0) {
+        close(to_child[1]);
+        close(from_child[0]);
         waitpid(pid, NULL, 0);
         return -1;
     }
-    close(to_handler[1]);
+    close(to_child[1]);
 
-    /* read result into fixed static buffer — hard cap enforced */
     size_t  len = 0;
     ssize_t n;
-    while ((n = read(from_handler[0],
-                     g_result_buf + len,
-                     ACTOR_MAX_PAYLOAD - len)) > 0) {
+    while ((n = read(from_child[0], out + len, out_cap - len)) > 0) {
         len += (size_t)n;
-        if (len == ACTOR_MAX_PAYLOAD) {
-            /* cap hit — drain and discard remainder, signal overflow */
+        if (len == out_cap) {
             uint8_t drain[256];
-            while (read(from_handler[0], drain, sizeof(drain)) > 0) {}
-            close(from_handler[0]);
+            while (read(from_child[0], drain, sizeof(drain)) > 0) {}
+            close(from_child[0]);
             waitpid(pid, NULL, 0);
             fprintf(stderr, "[actor] result exceeded ACTOR_MAX_PAYLOAD=%d, dropping\n",
                     ACTOR_MAX_PAYLOAD);
             return -2;
         }
     }
-    close(from_handler[0]);
+    close(from_child[0]);
 
     int status;
     waitpid(pid, &status, 0);
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-        return -1;
-    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return -1;
 
     return (ssize_t)len;
+}
+
+#endif /* _WIN32 */
+
+/* invoke_handler: set env vars, spawn handler, return result length */
+static ssize_t invoke_handler(const actor_header_t* hdr,
+                              const uint8_t*        payload,
+                              size_t                payload_len) {
+    /* Set env vars before spawn — child inherits parent's environment.
+     * On Unix (fork): child gets a copy. On Windows: child gets current env. */
+    char id_hex[33], corr_hex[33], caus_hex[33], attempt_str[12];
+    actor_uuid_hex(hdr->id,             id_hex);
+    actor_uuid_hex(hdr->correlation_id, corr_hex);
+    actor_uuid_hex(hdr->causation_id,   caus_hex);
+    snprintf(attempt_str, sizeof(attempt_str), "%d", hdr->attempt);
+
+#ifdef _WIN32
+    SetEnvironmentVariableA("ACTOR_TUPLE_ID",       id_hex);
+    SetEnvironmentVariableA("ACTOR_CORRELATION_ID", corr_hex);
+    SetEnvironmentVariableA("ACTOR_CAUSATION_ID",   caus_hex);
+    SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   hdr->origin);
+    SetEnvironmentVariableA("ACTOR_ATTEMPT",        attempt_str);
+#else
+    setenv("ACTOR_TUPLE_ID",       id_hex,      1);
+    setenv("ACTOR_CORRELATION_ID", corr_hex,    1);
+    setenv("ACTOR_CAUSATION_ID",   caus_hex,    1);
+    setenv("ACTOR_TUPLE_ORIGIN",   hdr->origin, 1);
+    setenv("ACTOR_ATTEMPT",        attempt_str, 1);
+#endif
+
+    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */

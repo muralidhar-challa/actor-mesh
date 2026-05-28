@@ -1,31 +1,57 @@
 # Makefile — actor mesh runtime
 #
 # ── Build ──────────────────────────────────────────────────────────────────
-#   make          build actor + mesh-proxy
-#   make clean    remove binaries
+#   make              build natively for current platform
+#   make clean        remove binaries
+#
+# ── Cross-compile ──────────────────────────────────────────────────────────
+#   Requires target libc + nng + lmdb. Use zig or musl-cross for easy setup:
+#
+#   make linux-arm64  CC="zig cc" TARGET=aarch64-linux-musl
+#   make windows-x64  CC="zig cc" TARGET=x86_64-windows-gnu
+#   make macos-x64    CC="zig cc" TARGET=x86_64-macos
 #
 # ── Deps ───────────────────────────────────────────────────────────────────
 #   Fedora/RHEL:  dnf install nng-devel lmdb-devel
 #   Debian/Ubuntu: apt install libnng-dev liblmdb-dev
 
-CC     = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c11 -Iruntime
-LIBS   = -lnng -llmdb
+CC      ?= gcc
+TARGET  ?= native
+CFLAGS  = -Wall -Wextra -O2 -std=c11 -Iruntime
+LDFLAGS =
+LIBS    = -lnng -llmdb
 
 ifdef ACTOR_MAX_PAYLOAD
 CFLAGS += -DACTOR_MAX_PAYLOAD=$(ACTOR_MAX_PAYLOAD)
 endif
 
-.PHONY: all actor proxy clean
+ifneq ($(TARGET),native)
+  CFLAGS  += -target $(TARGET)
+endif
+
+.PHONY: all actor mesh-proxy clean linux-arm64 macos-x64 macos-arm64 windows-x64
 
 all: actor mesh-proxy
 
 actor: runtime/main.c runtime/actor.c runtime/actor.h \
        runtime/actor_tuple.h runtime/actor_uuid.h
-	$(CC) $(CFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o actor
+	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o actor
 
 mesh-proxy: proxy/proxy.c
-	$(CC) $(CFLAGS) proxy/proxy.c $(LIBS) -o mesh-proxy
+	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o mesh-proxy
 
 clean:
 	rm -f actor mesh-proxy
+
+# Cross-compile convenience targets — use with CC=zig or CC=clang + sysroot
+linux-arm64:
+	$(MAKE) CC="$(CC)" TARGET=aarch64-linux-musl
+
+macos-x64:
+	$(MAKE) CC="$(CC)" TARGET=x86_64-macos
+
+macos-arm64:
+	$(MAKE) CC="$(CC)" TARGET=aarch64-macos
+
+windows-x64:
+	$(MAKE) CC="$(CC)" TARGET=x86_64-windows-gnu
