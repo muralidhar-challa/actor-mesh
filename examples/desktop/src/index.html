@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Actor Mesh</title>
+<style>
+  /* ── Design tokens from docs/styles.scss ── */
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap');
+
+  :root {
+    --bg:      #f9f9f8;
+    --fg:      #1a1a1a;
+    --fg-dim:  #2a2a2a;
+    --muted:   #888;
+    --border:  #e2e2e2;
+    --accent:  #c41e3a;
+    --dark:    #0a0a0a;
+    --card-bg: #fff;
+    --mono:    'IBM Plex Mono', monospace;
+    --sans:    'IBM Plex Sans', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15px; line-height: 1.7; padding: 2rem; }
+
+  h1 { font-size: 1.9rem; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 0.3rem; }
+  h2 { font-size: 1rem; font-weight: 600; color: var(--dark); margin: 1.5rem 0 0.5rem; padding-bottom: 0.35rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 0.4rem; }
+
+  /* ── Stats ── */
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); margin-bottom: 1.5rem; }
+  .stat { background: var(--card-bg); padding: 0.9rem 1rem; }
+  .stat-num { font-family: var(--mono); font-size: 1.45rem; font-weight: 500; color: var(--accent); line-height: 1.1; }
+  .stat-lbl { font-size: 0.66rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 0.2rem; }
+
+  /* ── Table ── */
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; margin: 0.5rem 0 1rem; }
+  thead th { background: var(--dark); color: #fff; font-weight: 500; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.45rem 0.8rem; text-align: left; }
+  tbody td { padding: 0.4rem 0.8rem; border-bottom: 1px solid #eee; color: var(--fg-dim); font-family: var(--mono); font-size: 0.8rem; }
+  tbody tr:hover td { background: #f5f5f4; }
+
+  /* ── Status dot ── */
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-alive { background: #22c55e; }
+  .dot-dead  { background: #ccc; }
+
+  /* ── Pill ── */
+  .pill { display: inline-block; background: #f0f0ee; border: 1px solid #ddd; color: #333; font-size: 0.72rem; font-family: var(--mono); padding: 0.18em 0.7em; border-radius: 2px; margin: 0.12em; }
+
+  /* ── Message feed ── */
+  .msg-row { display: grid; grid-template-columns: 140px 180px 1fr 160px; gap: 0; border-bottom: 1px solid #eee; font-size: 0.78rem; align-items: center; }
+  .msg-row:hover { background: #f5f5f4; }
+  .msg-row > span { padding: 0.3rem 0.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Input ── */
+  .cmd-bar { display: flex; gap: 0.5rem; margin-top: 1rem; }
+  .cmd-bar input { flex: 1; border: 1px solid var(--border); padding: 0.5rem 0.8rem; font-family: var(--mono); font-size: 0.85rem; background: var(--card-bg); }
+  .cmd-bar button { background: var(--dark); color: #fff; border: none; padding: 0.5rem 1.2rem; font-family: var(--sans); font-size: 0.8rem; font-weight: 600; cursor: pointer; }
+  .cmd-bar button:hover { background: var(--accent); }
+  .cmd-bar select { border: 1px solid var(--border); padding: 0.5rem; font-family: var(--mono); font-size: 0.85rem; }
+
+  /* ── Status bar ── */
+  .status-bar { font-size: 0.72rem; color: var(--muted); margin-top: 1.5rem; border-top: 1px solid var(--border); padding-top: 0.5rem; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<h1>Actor Mesh</h1>
+
+<div class="stat-row" id="stats"></div>
+
+<h2>Actors</h2>
+<table>
+  <thead><tr><th>ID</th><th>Inbox</th><th>Outbox</th><th>Status</th></tr></thead>
+  <tbody id="actors-tbody"><tr><td colspan="4" style="text-align:center;color:var(--muted);">no actors yet — start the mesh</td></tr></tbody>
+</table>
+
+<h2>Live Messages</h2>
+<div style="max-height:400px;overflow-y:auto;border:1px solid var(--border);background:var(--card-bg);" id="msg-feed">
+  <div style="padding:1rem;color:var(--muted);text-align:center;">waiting for messages...</div>
+</div>
+
+<div class="cmd-bar">
+  <input id="topic-input" type="text" placeholder="topic" value="shell_exec" style="max-width:180px;">
+  <input id="payload-input" type="text" placeholder='{"command":"date","timeout":5}'>
+  <button id="send-btn">Publish</button>
+</div>
+
+<div class="status-bar">
+  <span id="conn-status">disconnected</span>
+  <span>proxy: <span id="proxy-url">—</span></span>
+</div>
+
+<script type="module">
+  import { invoke } from 'https://cdn.jsdelivr.net/npm/@tauri-apps/api@2/dist/index.min.js';
+  import { listen } from 'https://cdn.jsdelivr.net/npm/@tauri-apps/api@2/dist/event.min.js';
+
+  function fmtBytes(n) { return n === 0 ? '0' : n < 1024 ? n + ' B' : (n/1024).toFixed(1) + ' K'; }
+
+  async function refresh() {
+    try {
+      const s = await invoke('get_state');
+      // Stats
+      const alive = Object.values(s.actors).filter(a => a.alive).length;
+      const totalMsgs = s.messages.length;
+      document.getElementById('stats').innerHTML = `
+        <div class="stat"><div class="stat-num">${alive}</div><div class="stat-lbl">Actors Online</div></div>
+        <div class="stat"><div class="stat-num">${totalMsgs}</div><div class="stat-lbl">Messages</div></div>
+        <div class="stat"><div class="stat-num">${s.connected ? '●' : '○'}</div><div class="stat-lbl">Connected</div></div>
+      `;
+
+      // Actors table
+      const ids = Object.keys(s.actors).sort();
+      if (ids.length === 0) {
+        document.getElementById('actors-tbody').innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);">no actors yet</td></tr>';
+      } else {
+        document.getElementById('actors-tbody').innerHTML = ids.map(id => {
+          const a = s.actors[id];
+          return `<tr>
+            <td><span class="dot ${a.alive ? 'dot-alive' : 'dot-dead'}"></span>${id}</td>
+            <td>${fmtBytes(a.inbox)}</td>
+            <td>${fmtBytes(a.outbox)}</td>
+            <td>${a.alive ? '<span class="pill">alive</span>' : '<span class="pill" style="opacity:0.5">offline</span>'}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      // Message feed
+      if (s.messages.length === 0) {
+        document.getElementById('msg-feed').innerHTML = '<div style="padding:1rem;color:var(--muted);text-align:center;">waiting for messages...</div>';
+      } else {
+        document.getElementById('msg-feed').innerHTML = s.messages.slice(-100).reverse().map(m => {
+          const d = new Date(m.timestamp * 1000);
+          const time = d.toLocaleTimeString();
+          return `<div class="msg-row">
+            <span style="font-weight:600;color:var(--accent);">${m.topic}</span>
+            <span style="color:var(--muted);">${m.origin}</span>
+            <span style="font-family:var(--mono);">${m.payload_preview}</span>
+            <span style="color:var(--muted);text-align:right;">${time}</span>
+          </div>`;
+        }).join('');
+      }
+
+      document.getElementById('conn-status').textContent = s.connected ? 'connected' : 'disconnected';
+      document.getElementById('conn-status').style.color = s.connected ? '#22c55e' : 'var(--muted)';
+      document.getElementById('proxy-url').textContent = s.proxy_url;
+    } catch(e) {
+      console.error('refresh:', e);
+    }
+  }
+
+  // Listen for updates from Rust
+  listen('mesh-update', () => refresh());
+
+  // Send message
+  document.getElementById('send-btn').addEventListener('click', async () => {
+    const topic = document.getElementById('topic-input').value;
+    const payload = document.getElementById('payload-input').value;
+    try {
+      await invoke('publish_message', { topic, payload });
+      document.getElementById('payload-input').value = '';
+    } catch(e) {
+      alert('publish failed: ' + e);
+    }
+  });
+
+  // Initial load
+  refresh();
+</script>
+
+</body>
+</html>
