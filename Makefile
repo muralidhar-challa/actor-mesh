@@ -53,14 +53,10 @@ clean:
 	rm -f actor mesh-proxy
 
 # Cross-compile convenience targets — use with CC=zig or CC=clang + sysroot
+# Cross-compile targets (use CC=zig cc). Linux works out of box.
+# Windows/macOS need extra SDK — use build.sh for those.
 linux-arm64:
 	$(MAKE) CC="$(CC)" TARGET=aarch64-linux-musl
 
-macos-x64:
-	$(MAKE) CC="$(CC)" TARGET=x86_64-macos
-
-macos-arm64:
-	$(MAKE) CC="$(CC)" TARGET=aarch64-macos
-
-windows-x64:
-	$(MAKE) CC="$(CC)" TARGET=x86_64-windows-gnu
+linux-x64-static:
+	$(MAKE) CC="$(CC)" TARGET=x86_64-linux-musl

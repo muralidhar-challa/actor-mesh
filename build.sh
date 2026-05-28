@@ -1,11 +1,11 @@
 #!/bin/bash
 # build.sh — cross-platform build for actor mesh
 #
-# Usage:
-#   ./build.sh                          native build
-#   ./build.sh --target aarch64-linux-musl   ARM64 static
-#   ./build.sh --target x86_64-windows-gnu   Windows .exe
-#   ./build.sh --target x86_64-macos         Intel Mac
+# Verified targets:
+#   ./build.sh --target x86_64-linux-musl     ✓ static Linux
+#   ./build.sh --target aarch64-linux-musl    ✓ static ARM64 (Raspberry Pi, etc.)
+#   ./build.sh --target x86_64-windows-gnu    ⚠ nng/zig MinGW headers clash
+#   ./build.sh --target aarch64-macos         ⚠ needs macOS SDK
 #
 # Requires: zig (https://ziglang.org/download)
 # Zig bundles clang + libc headers for every target. No sysroot needed.
@@ -31,12 +31,11 @@ DEPS_DIR="$BUILD_DIR/deps"
 
 if [ "$TARGET" != "native" ]; then
     CFLAGS="$CFLAGS -target $TARGET"
-    LDFLAGS="-target $TARGET"
-    # static linking for musl targets
-    case "$TARGET" in
-        *musl*) LDFLAGS="$LDFLAGS -static" ;;
-    esac
 fi
+
+# Binary extension
+EXE=""
+case "$TARGET" in *windows*) EXE=".exe" ;; esac
 
 echo "=== actor mesh build ==="
 echo "  target: $TARGET"
@@ -81,8 +80,15 @@ if [ ! -f "$DEPS_DIR/libnng.a" ]; then
     export AR="$ZIG ar"
     export RANLIB="$ZIG ranlib"
     CFLAGS_CMAKE=""
+    CMAKE_SYSTEM=""
+    case "$TARGET" in
+        *windows*) CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Windows" ;;
+        *macos*|*darwin*) CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Darwin" ;;
+        *linux*)  CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Linux" ;;
+    esac
     [ "$TARGET" != "native" ] && CFLAGS_CMAKE="-target $TARGET"
     cmake "$NNG_SRC" \
+        $CMAKE_SYSTEM \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DNNG_PROTOCOL_PAIR0=OFF \
@@ -112,16 +118,22 @@ fi
 echo "=== building actor mesh ==="
 INCLUDES="-I$NNG_SRC/include -I$LMDB_SRC"
 LIBS="$DEPS_DIR/libnng.a $DEPS_DIR/liblmdb.a -lpthread"
+LDFLAGS=""
+
+# static linking for musl Linux
+case "$TARGET" in
+    *musl*) LDFLAGS="$LDFLAGS -static" ;;
+esac
 
 $ZIG cc $CFLAGS $LDFLAGS $INCLUDES \
     "$ROOT/runtime/main.c" "$ROOT/runtime/actor.c" \
-    $LIBS -o "$BUILD_DIR/actor"
+    $LIBS -o "$BUILD_DIR/actor$EXE"
 
 $ZIG cc $CFLAGS $LDFLAGS $INCLUDES \
     "$ROOT/proxy/proxy.c" \
-    $LIBS -o "$BUILD_DIR/mesh-proxy"
+    $LIBS -o "$BUILD_DIR/mesh-proxy$EXE"
 
 echo ""
 echo "=== done ==="
-ls -lh "$BUILD_DIR/actor" "$BUILD_DIR/mesh-proxy"
-file "$BUILD_DIR/actor"
+ls -lh "$BUILD_DIR/actor$EXE" "$BUILD_DIR/mesh-proxy$EXE"
+file "$BUILD_DIR/actor$EXE"
