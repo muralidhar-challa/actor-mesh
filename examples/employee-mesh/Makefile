@@ -1,18 +1,13 @@
 # Makefile — employee mesh demo
 #
-# ── Build ──────────────────────────────────────────────────────────────────
-#   make all              build client + handlers
-#   make clean            remove local binaries
+# ── Quick start ────────────────────────────────────────────────────────────
+#   make                build handlers
+#   make ui             setup desktop UI deps
+#   make run-ui         start proxy + actors + desktop UI
+#   make stop           kill everything
 #
-# ── Run ────────────────────────────────────────────────────────────────────
-#   make run              start proxy + all actors
-#   make stop             kill all mesh processes + wipe LMDB
-#   make query Q="list all engineers"
-#
-# ── Prerequisites ──────────────────────────────────────────────────────────
-#   Build runtime first:  cd ../.. && make
-#   Deps: libnng-dev liblmdb-dev libcurl-devel sqlite3-devel
-#   Or vendor nng:         git submodule add https://github.com/nanomsg/nng.git vendor/nng
+# ── LLM key ────────────────────────────────────────────────────────────────
+#   export LLM_API_KEY=sk-... && make run-ui
 
 ROOT    = ../..
 RUNTIME = $(ROOT)/runtime
@@ -29,171 +24,84 @@ NER_INCS     = -I$(ROOT)/vendor/smhasher -I$(ROOT) -I/usr/include/onnxruntime
 NER_LIBS     = -lonnxruntime -lstdc++
 SMHASHER     = $(ROOT)/vendor/smhasher/MurmurHash2.cpp
 
-MPACK_SRCS = \
-	$(VENDOR)/mpack/src/mpack/mpack-common.c \
-	$(VENDOR)/mpack/src/mpack/mpack-platform.c \
-	$(VENDOR)/mpack/src/mpack/mpack-reader.c \
-	$(VENDOR)/mpack/src/mpack/mpack-writer.c \
-	$(VENDOR)/mpack/src/mpack/mpack-expect.c \
-	$(VENDOR)/mpack/src/mpack/mpack-node.c
-
-CJSON = $(VENDOR)/cjson/cJSON.c
-
-ACTOR  = $(ROOT)/actor
-PROXY  = $(ROOT)/mesh-proxy
+MPACK_SRCS = $(VENDOR)/mpack/src/mpack/mpack-common.c $(VENDOR)/mpack/src/mpack/mpack-platform.c $(VENDOR)/mpack/src/mpack/mpack-reader.c $(VENDOR)/mpack/src/mpack/mpack-writer.c $(VENDOR)/mpack/src/mpack/mpack-expect.c $(VENDOR)/mpack/src/mpack/mpack-node.c
+CJSON      = $(VENDOR)/cjson/cJSON.c
+ACTOR      = $(ROOT)/actor
+PROXY      = $(ROOT)/mesh-proxy
 
 # ── Build ──────────────────────────────────────────────────────────────────
 
-.PHONY: all client tui handlers clean
+.PHONY: all handlers ui client tui clean
 
-all: client tui handlers
-
-client: client.c $(MPACK_SRCS)
-	$(CC) $(CFLAGS) client.c $(MPACK_SRCS) $(LIBS) -o client
-
-tui: tui.c $(MPACK_SRCS)
-	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o tui
+all: handlers
 
 handlers: handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
 
 handlers/llm-agent: handlers/llm-agent.c $(MPACK_SRCS) $(CJSON)
-	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o handlers/llm-agent
+	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
 
 handlers/sqlite-tool: handlers/sqlite-tool.c $(MPACK_SRCS)
-	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o handlers/sqlite-tool
+	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o $@
 
 handlers/pii-filter: handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER)
-	$(CXX) $(CFLAGS) $(NER_INCS) handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER) \
-		$(HANDLER_LIBS) $(NER_LIBS) -o handlers/pii-filter
+	$(CXX) $(CFLAGS) $(NER_INCS) handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER) $(HANDLER_LIBS) $(NER_LIBS) -o $@
+
+client: client.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) client.c $(MPACK_SRCS) $(LIBS) -o $@
+
+tui: tui.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o $@
+
+ui:
+	@cd ui && npm install && gcc -Wall -O2 -std=c11 bridge.c -lnng -o src-tauri/bridge && echo "[ui] ready"
 
 clean:
 	rm -f client tui handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
+	cd ui && rm -rf src-tauri/target src-tauri/bridge node_modules 2>/dev/null; true
 
-# ── Paths ──────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 
-LMDB_BASE    ?= /tmp/actor-mesh
-TOKENMAP_PATH ?= $(LMDB_BASE)/tokenmap
-EMPLOYEE_DB  ?= $(abspath db/employee.db)
+LMDB_BASE   ?= /tmp/actor-mesh
+EMPLOYEE_DB ?= $(abspath db/employee.db)
+LOGDIR      ?= $(LMDB_BASE)/logs
 
-# ── Bus ────────────────────────────────────────────────────────────────────
-
-PROXY_SUB_BIND ?= tcp://*:5557
-PROXY_PUB_BIND ?= tcp://*:5556
-BUS_SUB        ?= tcp://localhost:5556
-BUS_PUB        ?= tcp://localhost:5557
-
-# ── LLM (OpenAI-compatible: DeepSeek, OpenAI, etc.) ───────────────────────
+BUS_SUB ?= tcp://127.0.0.1:5556
+BUS_PUB ?= tcp://127.0.0.1:5557
 
 LLM_BASE_URL ?= https://api.deepseek.com
 LLM_API_KEY  ?=
 LLM_MODEL    ?= deepseek-chat
 
-# ── Common actor env ───────────────────────────────────────────────────────
-
-COMMON_ENV = \
-	ACTOR_BUS_SUB=$(BUS_SUB) \
-	ACTOR_BUS_PUB=$(BUS_PUB) \
-	ACTOR_HEARTBEAT_MS=5000 \
-	ACTOR_RETRY_MAX=3 \
-	ACTOR_TTL_NS=300000000000
+COMMON_ENV = ACTOR_BUS_SUB=$(BUS_SUB) ACTOR_BUS_PUB=$(BUS_PUB) ACTOR_HEARTBEAT_MS=2000 ACTOR_RETRY_MAX=3
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop run-proxy run-sqlite-tool run-llm-agent run-tokenise run-detokenise run-shell-exec query chat
-
-run: run-proxy run-tokenise run-detokenise run-sqlite-tool run-llm-agent
-	@echo "[mesh] employee mesh running (PII tokenisation enabled)"
-	@echo "[mesh] try: make query Q=\"list all engineers\""
+.PHONY: stop run-ui
 
 stop:
-	@pkill -9 mesh-proxy || true
-	@pkill -9 actor || true
+	@pkill -9 mesh-proxy 2>/dev/null; true
+	@pkill -9 actor 2>/dev/null; true
+	@pkill -9 actor-mesh-desktop 2>/dev/null; true
 	@rm -rf $(LMDB_BASE)
-	@echo "[mesh] stopped  (logs were in $(LOGDIR))"
+	@echo "[mesh] stopped"
 
-LOGDIR ?= /tmp/actor-mesh/logs
-
-run-proxy:
-	@mkdir -p $(LMDB_BASE) $(LOGDIR) $(TOKENMAP_PATH)
-	@PROXY_SUB_BIND=$(PROXY_SUB_BIND) \
-	PROXY_PUB_BIND=$(PROXY_PUB_BIND) \
-	$(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
+run-ui: stop
+	@# proxy
+	@mkdir -p $(LMDB_BASE) $(LOGDIR)
+	@PROXY_SUB_BIND=tcp://127.0.0.1:5557 PROXY_PUB_BIND=tcp://127.0.0.1:5556 $(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
+	@sleep 0.3
+	@# sqlite-tool
+	@mkdir -p $(LMDB_BASE)/sqlite-tool
+	@$(COMMON_ENV) ACTOR_ID=sqlite-tool-1 ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result ACTOR_HANDLER=$(abspath handlers/sqlite-tool) ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool EMPLOYEE_DB=$(EMPLOYEE_DB) $(ACTOR) >>$(LOGDIR)/sqlite-tool.log 2>&1 &
 	@sleep 0.2
-	@echo "[proxy] started  (log: $(LOGDIR)/proxy.log)"
-
-run-sqlite-tool:
-	@mkdir -p $(LMDB_BASE)/sqlite-tool $(LOGDIR)
-	@$(COMMON_ENV) \
-	ACTOR_ID=sqlite-tool-1 \
-	ACTOR_TOPIC=sql_query \
-	ACTOR_RESULT_TOPIC=sql_result \
-	ACTOR_HANDLER=$(abspath handlers/sqlite-tool) \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
-	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR) >>$(LOGDIR)/sqlite-tool.log 2>&1 &
-	@echo "[actor] sqlite-tool started  (log: $(LOGDIR)/sqlite-tool.log)"
-
-run-llm-agent:
-	@mkdir -p $(LMDB_BASE)/llm-agent $(LOGDIR)
-	@$(COMMON_ENV) \
-	ACTOR_ID=llm-agent-1 \
-	ACTOR_TOPIC=user_message_masked,sql_result_masked \
-	ACTOR_RESULT_TOPIC=sql_query_masked \
-	ACTOR_HANDLER=$(abspath handlers/llm-agent) \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
-	LLM_BASE_URL=$(LLM_BASE_URL) \
-	LLM_API_KEY=$(LLM_API_KEY) \
-	LLM_MODEL=$(LLM_MODEL) \
-	EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	$(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
-	@echo "[actor] llm-agent started  (log: $(LOGDIR)/llm-agent.log)"
-
-run-tokenise:
-	@mkdir -p $(LMDB_BASE)/tokenise $(LOGDIR)
-	@$(COMMON_ENV) \
-	ACTOR_ID=tokenise-1 \
-	ACTOR_TOPIC=user_message,sql_result \
-	ACTOR_RESULT_TOPIC=user_message_masked \
-	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
-	PII_MODE=mask \
-	NER_MODEL_PATH=$(NER_MODEL) \
-	TOKENMAP_PATH=$(TOKENMAP_PATH) \
-	$(ACTOR) >>$(LOGDIR)/tokenise.log 2>&1 &
-	@echo "[actor] tokenise started  (log: $(LOGDIR)/tokenise.log)"
-
-run-detokenise:
-	@mkdir -p $(LMDB_BASE)/detokenise $(LOGDIR)
-	@$(COMMON_ENV) \
-	ACTOR_ID=detokenise-1 \
-	ACTOR_TOPIC=sql_query_masked,agent_response_masked \
-	ACTOR_RESULT_TOPIC=agent_response \
-	ACTOR_HANDLER=$(abspath handlers/pii-filter) \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
-	PII_MODE=restore \
-	TOKENMAP_PATH=$(TOKENMAP_PATH) \
-	$(ACTOR) >>$(LOGDIR)/detokenise.log 2>&1 &
-	@echo "[actor] detokenise started  (log: $(LOGDIR)/detokenise.log)"
-
-# ── Shell Exec ────────────────────────────────────────────────────────────
-
-run-shell-exec:
-	@mkdir -p $(LMDB_BASE)/shell-exec $(LOGDIR)
-	@$(COMMON_ENV) \
-	ACTOR_ID=shell-exec-1 \
-	ACTOR_TOPIC=shell_exec \
-	ACTOR_RESULT_TOPIC=shell_result \
-	ACTOR_HANDLER=$(abspath handlers/shell-exec) \
-	ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
-	$(ACTOR) >>$(LOGDIR)/shell-exec.log 2>&1 &
-	@echo "[actor] shell-exec started  (log: $(LOGDIR)/shell-exec.log)"
-
-# ── Query / Chat ───────────────────────────────────────────────────────────
-
-Q ?= list all employees
-
-query:
-	@./client "$(Q)"
-
-chat:
-	@./tui
+	@# llm-agent
+	@mkdir -p $(LMDB_BASE)/llm-agent
+	@$(COMMON_ENV) ACTOR_ID=llm-agent-1 ACTOR_TOPIC=user_message,sql_result ACTOR_RESULT_TOPIC=agent_response ACTOR_HANDLER=$(abspath handlers/llm-agent) ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent LLM_BASE_URL=$(LLM_BASE_URL) LLM_API_KEY=$(LLM_API_KEY) LLM_MODEL=$(LLM_MODEL) EMPLOYEE_DB=$(EMPLOYEE_DB) $(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
+	@sleep 0.2
+	@# shell-exec
+	@mkdir -p $(LMDB_BASE)/shell-exec
+	@$(COMMON_ENV) ACTOR_ID=shell-exec-1 ACTOR_TOPIC=shell_exec ACTOR_RESULT_TOPIC=shell_result ACTOR_HANDLER=$(abspath handlers/shell-exec) ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec $(ACTOR) >>$(LOGDIR)/shell-exec.log 2>&1 &
+	@sleep 0.2
+	@echo "[mesh] proxy + 3 actors running"
+	@echo ""
+	@cd ui && GSK_RENDERER=cairo GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 npx tauri dev
