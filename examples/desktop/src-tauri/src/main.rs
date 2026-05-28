@@ -1,13 +1,17 @@
 // main.rs — Actor Mesh desktop dashboard
 //
-// This is an ACTOR on the mesh. It subscribes to heartbeat + all topics,
-// maintains live state, and exposes it to the Tauri frontend via IPC.
-// The frontend is just a rendering surface — all mesh logic is here.
+// This is an ACTOR on the mesh. It subscribes to all topics,
+// maintains live state, and exposes it to the Tauri frontend.
+// The frontend is a rendering surface — all mesh logic is here.
 
-use nng::*;
+use nng::{
+    options::{protocol::pubsub::Subscribe, Options, RecvTimeout},
+    Protocol, Socket,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::State;
 
 // ── Mesh state ──────────────────────────────────────────────────────────────
@@ -29,7 +33,7 @@ struct MessageEntry {
     timestamp: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 struct MeshState {
     actors: HashMap<String, ActorInfo>,
     messages: Vec<MessageEntry>,
@@ -41,7 +45,7 @@ struct AppState {
     mesh: Mutex<MeshState>,
 }
 
-// ── Wire format (mirrors actor_tuple.h) ────────────────────────────────────
+// ── Wire format helpers ────────────────────────────────────────────────────
 
 const HEADER_SIZE: usize = 256;
 
@@ -66,15 +70,15 @@ fn get_state(state: State<AppState>) -> MeshState {
 
 #[tauri::command]
 fn publish_message(topic: String, payload: String) -> Result<(), String> {
-    // Connect to proxy and publish
     let pub_sock = Socket::new(Protocol::Pub0).map_err(|e| e.to_string())?;
     pub_sock
         .dial("tcp://127.0.0.1:5557")
         .map_err(|e| e.to_string())?;
 
-    // Build header + payload
+    // Build header (256 bytes) + payload
     let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
-    frame[..topic.len().min(31)].copy_from_slice(topic.as_bytes());
+    let tbytes = topic.as_bytes();
+    frame[..tbytes.len().min(31)].copy_from_slice(&tbytes[..tbytes.len().min(31)]);
     frame[HEADER_SIZE..].copy_from_slice(payload.as_bytes());
 
     pub_sock.send(&frame).map_err(|e| e.to_string())?;
@@ -83,7 +87,7 @@ fn publish_message(topic: String, payload: String) -> Result<(), String> {
 
 // ── Background mesh listener ───────────────────────────────────────────────
 
-fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) {
+fn mesh_listener(state: tauri::AppHandle, proxy_sub: String) {
     std::thread::spawn(move || {
         let sub = match Socket::new(Protocol::Sub0) {
             Ok(s) => s,
@@ -98,9 +102,10 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
             return;
         }
 
-        // Subscribe to everything
-        sub.set_opt::<nng::opt::sub::Subscribe>(b"").ok();
-        sub.set_opt::<nng::opt::RecvTimeout>(Some(std::time::Duration::from_millis(200)))
+        // Subscribe to everything (empty = all topics)
+        let all: Vec<u8> = vec![];
+        sub.set_opt::<Subscribe>(all).ok();
+        sub.set_opt::<RecvTimeout>(Some(Duration::from_millis(200)))
             .ok();
 
         let mut ring: Vec<MessageEntry> = Vec::new();
@@ -108,7 +113,7 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
         loop {
             match sub.recv() {
                 Ok(msg) => {
-                    let data: &[u8] = &msg;
+                    let data = msg.as_ref();
                     if data.len() < HEADER_SIZE {
                         continue;
                     }
@@ -116,7 +121,6 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
                     let topic = read_topic(&data[0..32]);
                     let origin = read_topic(&data[64..96]);
 
-                    // Preview: first 200 bytes of payload
                     let payload_data = &data[HEADER_SIZE..];
                     let preview = String::from_utf8_lossy(
                         &payload_data[..payload_data.len().min(200)],
@@ -131,7 +135,7 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
                         timestamp: ts,
                     };
 
-                    // Track actor presence from heartbeat
+                    // Track actor presence from heartbeat payloads
                     if topic == "heartbeat" {
                         if let Ok(parsed) =
                             serde_json::from_slice::<serde_json::Value>(payload_data)
@@ -153,7 +157,6 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
                                         alive: true,
                                     },
                                 );
-                                // Mark stale actors
                                 for actor in mesh.actors.values_mut() {
                                     if ts - actor.last_seen > 15 {
                                         actor.alive = false;
@@ -169,18 +172,16 @@ fn mesh_listener(state: tauri::AppHandle, proxy_sub: String, proxy_pub: String) 
                         ring.remove(0);
                     }
 
-                    // Push state update to frontend
+                    // Push update to frontend
                     {
                         let s = state.state::<AppState>();
                         let mut mesh = s.mesh.lock().unwrap();
                         mesh.messages = ring.clone();
                         mesh.connected = true;
-                        mesh.proxy_url = proxy_pub.clone();
                     }
                     let _ = state.emit("mesh-update", ());
                 }
                 Err(nng::Error::TimedOut) => {
-                    // Mark actors stale
                     let s = state.state::<AppState>();
                     let mut mesh = s.mesh.lock().unwrap();
                     let now = ts_now();
@@ -216,7 +217,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![get_state, publish_message])
         .setup(|app| {
             let handle = app.handle().clone();
-            mesh_listener(handle, proxy_sub, proxy_pub);
+            mesh_listener(handle, proxy_sub);
             Ok(())
         })
         .run(tauri::generate_context!())
