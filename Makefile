@@ -17,6 +17,15 @@
 
 CC      ?= gcc
 TARGET  ?= native
+ZIG     ?= zig
+
+# Use zig cc if gcc not found — zig IS clang + cross-targets
+ifeq ($(shell which $(CC) 2>/dev/null),)
+  ifeq ($(shell which $(ZIG) 2>/dev/null),)
+    $(error neither $(CC) nor $(ZIG) found. Install zig: https://ziglang.org/download)
+  endif
+  CC := $(ZIG) cc
+endif
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -Iruntime
 LDFLAGS =
 LIBS    = -lnng -llmdb
