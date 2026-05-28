@@ -1,14 +1,18 @@
 #!/bin/bash
 # build.sh — cross-platform build for actor mesh
 #
-# Verified targets:
-#   ./build.sh --target x86_64-linux-musl     ✓ static Linux
-#   ./build.sh --target aarch64-linux-musl    ✓ static ARM64 (Raspberry Pi, etc.)
-#   ./build.sh --target x86_64-windows-gnu    ⚠ nng/zig MinGW headers clash
-#   ./build.sh --target aarch64-macos         ⚠ needs macOS SDK
+# Verified targets (works from Linux host):
+#   ./build.sh                                 native
+#   ./build.sh --target x86_64-linux-musl     ✓ static Intel binary
+#   ./build.sh --target aarch64-linux-musl    ✓ static ARM64 binary
+#
+# Needs target device (seconds to compile):
+#   macOS:   brew install nng lmdb && make
+#   Windows: MSYS2 + pacman -S mingw-w64-x86_64-nng mingw-w64-x86_64-lmdb
+#            then make CC=gcc
 #
 # Requires: zig (https://ziglang.org/download)
-# Zig bundles clang + libc headers for every target. No sysroot needed.
+# Zig bundles clang + libc headers. Linux targets need nothing else.
 
 set -e
 
@@ -83,8 +87,8 @@ if [ ! -f "$DEPS_DIR/libnng.a" ]; then
     CMAKE_SYSTEM=""
     case "$TARGET" in
         *windows*) CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Windows" ;;
-        *macos*|*darwin*) CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Darwin" ;;
-        *linux*)  CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Linux" ;;
+        *macos*)   CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Darwin" ;;
+        *linux*)   CMAKE_SYSTEM="-DCMAKE_SYSTEM_NAME=Linux" ;;
     esac
     [ "$TARGET" != "native" ] && CFLAGS_CMAKE="-target $TARGET"
     cmake "$NNG_SRC" \
