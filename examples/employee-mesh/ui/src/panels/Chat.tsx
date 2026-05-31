@@ -1,14 +1,11 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { marked } from "marked";
+import type { ChatMessage } from "../App";
 
-interface Message {
-  role: "user" | "agent";
-  text: string;
-}
+interface Props { history: ChatMessage[]; setHistory: (h: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => void }
 
-export default function Chat() {
-  const [history, setHistory] = useState<Message[]>([]);
+export default function Chat({ history, setHistory }: Props) {
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -16,75 +13,67 @@ export default function Chat() {
   const handleMeshUpdate = useCallback(async () => {
     if (!thinking) return;
     try {
-      const s = await invoke<{ messages: { topic: string; payload_preview: string }[] }>("get_state");
-      const responses = s.messages.filter(m => m.topic === "agent_response");
+      const s = await invoke<{ messages: { topic: string; answer: string }[] }>("get_state");
+      const responses = s.messages.filter(m => m.topic === "agent_response" && m.answer);
       if (responses.length > 0) {
-        const last = responses[responses.length - 1];
-        // Decode from base64 (since we can't pass raw bytes through invoke easily)
-        // Actually, let's use the payload directly — it's stored as JSON string in mesh state
-        try {
-          const parsed = JSON.parse(last.payload_preview);
-          if (parsed.answer) {
-            setHistory(h => [...h, { role: "agent", text: parsed.answer }]);
-            setThinking(false);
-          }
-        } catch {
-          // payload_preview might be truncated, try to extract answer
-          const match = last.payload_preview.match(/"answer":"([^"]+)"/);
-          if (match) {
-            setHistory(h => [...h, { role: "agent", text: match[1] }]);
-            setThinking(false);
-          }
-        }
+        setHistory(prev => [...prev, { role: "agent", text: responses[responses.length - 1].answer }]);
+        setThinking(false);
       }
     } catch(e) {}
-  }, [thinking]);
+  }, [thinking, setHistory]);
 
   useEffect(() => {
-    const unlisten = listen("mesh-update", () => handleMeshUpdate());
-    return () => { unlisten.then(f => f()); };
-  }, [handleMeshUpdate]);
+    if (!thinking) return;
+    const interval = setInterval(handleMeshUpdate, 500);
+    return () => clearInterval(interval);
+  }, [handleMeshUpdate, thinking]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [history]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [history]);
 
   const send = async () => {
     if (!input.trim()) return;
-    setHistory(h => [...h, { role: "user", text: input }]);
+    setHistory(prev => [...prev, { role: "user", text: input }]);
     setThinking(true);
-    try {
-      await invoke("chat_send", { query: input });
-    } catch(e) {
-      alert("send failed: " + e);
-    }
+    try { await invoke("chat_send", { query: input }); } catch(e) { alert("send failed: " + e); }
     setInput("");
   };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 100px)" }}>
-      <h2>Chat</h2>
-      <div style={{ flex: 1, overflowY: "auto", padding: "0.5rem 0" }}>
-        {history.map((m, i) => (
-          <div key={i} style={{
-            marginBottom: "0.5rem", padding: "0.5rem 0.8rem",
-            background: m.role === "user" ? "var(--card-bg)" : "#f5f5f4",
-            borderLeft: `3px solid ${m.role === "user" ? "var(--accent)" : "var(--dark)"}`,
-            fontFamily: m.role === "agent" ? "var(--sans)" : "var(--mono)",
-            fontSize: "0.85rem",
-          }}>
-            <strong style={{ color: m.role === "user" ? "var(--accent)" : "var(--dark)", fontSize: "0.7rem", textTransform: "uppercase" }}>
-              {m.role}
-            </strong>
-            <div style={{ marginTop: "0.2rem", color: "var(--fg-dim)" }}>{m.text}</div>
-          </div>
-        ))}
-        {thinking && <div style={{ padding: "0.5rem 0.8rem", color: "var(--muted)", fontStyle: "italic" }}>thinking...</div>}
+      <div style={{ flex: 1, overflowY: "auto", padding: "1rem 0" }}>
+        {history.map((m, i) =>
+          m.role === "user" ? (
+            <div key={i} style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.6rem" }}>
+              <div style={{
+                background: "var(--dark)", color: "#fff", padding: "0.5rem 0.9rem",
+                borderRadius: "12px 12px 2px 12px", maxWidth: "70%",
+                fontFamily: "var(--sans)", fontSize: "0.88rem", lineHeight: 1.5,
+              }}>
+                {m.text}
+              </div>
+            </div>
+          ) : (
+            <div key={i} style={{ marginBottom: "1rem", fontSize: "0.9rem", lineHeight: 1.7, color: "var(--fg-dim)" }}>
+              <div dangerouslySetInnerHTML={{ __html: marked.parse(m.text) as string }} />
+            </div>
+          )
+        )}
+        {thinking && <div style={{ color: "var(--muted)", fontStyle: "italic", padding: "0.5rem 0" }}>thinking...</div>}
         <div ref={bottomRef} />
       </div>
       <div className="cmd-bar">
-        <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="ask something..." />
-        <button onClick={send}>Send</button>
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && send()}
+          placeholder="ask about employees..."
+          style={{
+            background: "var(--dark)", color: "#fff", border: "none",
+            padding: "0.6rem 1rem", borderRadius: "12px",
+            fontFamily: "var(--sans)", fontSize: "0.88rem",
+          }}
+        />
+        <button onClick={send} style={{ borderRadius: "12px", padding: "0.6rem 1.4rem" }}>Send</button>
       </div>
     </div>
   );
