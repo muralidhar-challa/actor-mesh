@@ -362,6 +362,13 @@ static void decode_rows_to_json(mpack_reader_t* r) {
 
 static void emit_sql_query(const char* sql) {
     const char* topic = find_tool_topic("query_db");
+    /* Add _masked suffix if PII mode is enabled */
+    static char topic_buf[80];
+    const char* pii = getenv("PII_ENABLED");
+    if (pii && strcmp(pii, "1") == 0) {
+        snprintf(topic_buf, sizeof(topic_buf), "%s_masked", topic);
+        topic = topic_buf;
+    }
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
     mpack_start_map(&w, 2);
@@ -375,15 +382,17 @@ static void emit_sql_query(const char* sql) {
 }
 
 static void emit_answer(const char* answer) {
+    const char* pii = getenv("PII_ENABLED");
+    const char* topic = (pii && strcmp(pii, "1") == 0) ? "agent_response_masked" : "agent_response";
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
     mpack_start_map(&w, 2);
-    mpack_write_cstr(&w, "type");   mpack_write_cstr(&w, "agent_response_masked");
+    mpack_write_cstr(&w, "type");   mpack_write_cstr(&w, topic);
     mpack_write_cstr(&w, "answer"); mpack_write_cstr(&w, answer ? answer : "");
     mpack_finish_map(&w);
     size_t used = mpack_writer_buffer_used(&w);
     mpack_writer_destroy(&w);
-    fputs("agent_response_masked\n", stdout);
+    fputs(topic, stdout); fputc('\n', stdout);
     fwrite(g_out, 1, used, stdout);
 }
 
