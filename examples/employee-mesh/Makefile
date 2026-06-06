@@ -35,13 +35,10 @@ PROXY      = $(ROOT)/mesh-proxy
 
 all: handlers
 
-handlers: handlers/agents/llm-agent handlers/tools/sqlite-tool handlers/tools/pii-filter
 
 handlers/agents/llm-agent: handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON)
 	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
 
-handlers/tools/sqlite-tool: handlers/tools/sqlite-tool.c $(MPACK_SRCS)
-	$(CC) $(CFLAGS) handlers/tools/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o $@
 
 handlers/tools/pii-filter: handlers/tools/pii-filter.c $(MPACK_SRCS) $(SMHASHER)
 	$(CXX) $(CFLAGS) $(NER_INCS) handlers/tools/pii-filter.c $(MPACK_SRCS) $(SMHASHER) $(HANDLER_LIBS) $(NER_LIBS) -o $@
@@ -56,7 +53,6 @@ ui:
 	@cd ui && npm install && gcc -Wall -O2 -std=c11 bridge.c -lnng -o src-tauri/bridge && echo "[ui] ready"
 
 clean:
-	rm -f client tui handlers/agents/llm-agent handlers/tools/sqlite-tool handlers/tools/pii-filter
 	cd ui && rm -rf src-tauri/target src-tauri/bridge node_modules 2>/dev/null; true
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -113,15 +109,9 @@ run-ui: stop
 	@sleep 0.2
 	@echo "[actor] detokenise started"
 
-	@# sqlite-tool
-	@mkdir -p $(LMDB_BASE)/sqlite-tool
-	@$(COMMON_ENV) ACTOR_ID=sqlite-tool-1 \
 		ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result \
-		ACTOR_HANDLER=$(abspath handlers/tools/sqlite-tool) ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 		EMPLOYEE_DB=$(EMPLOYEE_DB) \
-		$(ACTOR) >>$(LOGDIR)/sqlite-tool.log 2>&1 &
 	@sleep 0.2
-	@echo "[actor] sqlite-tool started"
 
 	@# llm-agent — receives masked, emits masked
 	@mkdir -p $(LMDB_BASE)/llm-agent
