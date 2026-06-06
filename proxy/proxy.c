@@ -23,11 +23,11 @@ int main(void) {
     nng_socket sub, pub;
     int        rc;
 
-    if ((rc = nng_sub0_open_raw(&sub)) != 0) {
-        fprintf(stderr, "[proxy] nng_sub0_open_raw: %s\n", nng_strerror(rc));
+    if ((rc = nng_sub0_open(&sub)) != 0) {
+        fprintf(stderr, "[proxy] nng_sub0_open: %s\n", nng_strerror(rc));
         return 1;
     }
-    if ((rc = nng_pub0_open_raw(&pub)) != 0) {
+    if ((rc = nng_pub0_open(&pub)) != 0) {
         fprintf(stderr, "[proxy] nng_pub0_open: %s\n", nng_strerror(rc));
         nng_close(sub);
         return 1;
@@ -39,6 +39,9 @@ int main(void) {
         nng_close(sub);
         return 1;
     }
+    /* Subscribe to all topics */
+    nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
+
     if ((rc = nng_listen(pub, pub_bind, NULL, 0)) != 0) {
         fprintf(stderr, "[proxy] pub listen %s: %s\n", pub_bind, nng_strerror(rc));
         nng_close(pub);
@@ -48,8 +51,21 @@ int main(void) {
 
     fprintf(stderr, "[proxy] sub=%s pub=%s\n", sub_bind, pub_bind);
 
-    /* blocks forever — sub → pub forwarding, OS kills on SIGTERM */
-    nng_device(sub, pub);
+    /* Manual forwarding loop */
+    for (;;) {
+        nng_msg* msg = NULL;
+        if ((rc = nng_recvmsg(sub, &msg, 0)) != 0) {
+            fprintf(stderr, "[proxy] recv err: %s\n", nng_strerror(rc));
+            continue;
+        }
+        size_t len = nng_msg_len(msg);
+        fprintf(stderr, "[proxy] fwd %zu bytes\n", len);
+        rc = nng_sendmsg(pub, msg, 0);
+        nng_msg_free(msg);
+        if (rc != 0) {
+            fprintf(stderr, "[proxy] send err: %s\n", nng_strerror(rc));
+        }
+    }
 
     nng_close(pub);
     nng_close(sub);
