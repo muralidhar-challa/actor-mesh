@@ -1,24 +1,36 @@
 #!/bin/sh
-# mcp-bridge.sh — generic mesh → MCP adapter
-# Receives mpack payload from stdin, forwards to MCP server.
-# Env: MCP_SERVER (path), MCP_TOOL (name), MCP_ARGS (key to extract)
-# Output: topic_prefix\n + mpack result
+# tool-bridge.sh — generic mesh → MCP adapter
+# Env: MCP_SERVER, MCP_TOOL, MCP_ARG, BRIDGE_TOPIC, BRIDGE_LIB
+# Receives mpack from stdin, sends init+call to MCP server, returns mpack.
 
-# --- step 1: extract argument from mpack ---
-VAL=$(handlers/lib/mpack-get "${MCP_ARGS:-sql}" 2>/dev/null)
-[ -z "$VAL" ] && exit 0
+LIB="${BRIDGE_LIB:-$(dirname "$0")/../lib}"
+MCP="${MCP_SERVER:-mcp-server-sqlite}"
+TOOL="${MCP_TOOL:-read_query}"
+ARG="${MCP_ARG:-sql}"
+TOPIC="${BRIDGE_TOPIC:-sql_result}"
 
-# --- step 2: build MCP request ---
-REQUEST=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":{"%s":"%s"}}}' \
-  "${MCP_TOOL:-query}" "${MCP_ARGS:-sql}" "$VAL")
+# Save stdin to file (binary-safe, reusable)
+INPUT=$(mktemp)
+cat > "$INPUT"
 
-# --- step 3: call MCP server ---
-RESPONSE=$(printf '%s\n' "$REQUEST" | ${MCP_SERVER:-mcp-server-sqlite} 2>/dev/null)
+# Extract argument value from mpack
+VAL=$("$LIB/mpack-get" "$ARG" < "$INPUT" 2>/dev/null)
+[ -z "$VAL" ] && { rm -f "$INPUT"; exit 0; }
 
-# --- step 4: extract text from MCP response ---
-TEXT=$(echo "$RESPONSE" | sed 's/.*"text":"//;s/"}].*//;s/\\"/"/g;s/\\n/\
-/g')
+# Send initialize + tool call to a single MCP process
+REQ=$(mktemp)
+cat > "$REQ" <<REQUESTS
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mesh","version":"1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"$TOOL","arguments":{"$ARG":"$VAL"}}}
+REQUESTS
 
-# --- step 5: emit as mesh result ---
-printf "sql_result\n"
-handlers/lib/mpack-pack "text" "$TEXT"
+RESPONSE=$(cat "$REQ" | $MCP 2>/dev/null | tail -1)
+rm -f "$INPUT" "$REQ"
+
+# Extract text content from MCP response
+TEXT=$(echo "$RESPONSE" | jq -r '.result.content[0].text // empty' 2>/dev/null)
+[ -z "$TEXT" ] && TEXT="error: no response from MCP server"
+
+# Emit mesh result
+printf "%s\n" "$TOPIC"
+"$LIB/mpack-pack" "text" "$TEXT"
