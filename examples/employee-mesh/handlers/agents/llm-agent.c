@@ -388,6 +388,11 @@ static const char* openai_chat(const char* base_url, const char* api_key,
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
     headers = curl_slist_append(headers, auth);
 
+    /* Prompt caching — enable if PROMPT_CACHING env var is set */
+    if (getenv("PROMPT_CACHING")) {
+        headers = curl_slist_append(headers, "anthropic-beta: prompt-caching-2024-07-31");
+    }
+
     g_resp_len = 0; g_resp[0] = 0;
     curl_easy_setopt(curl, CURLOPT_URL, endpoint);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
