@@ -11,27 +11,23 @@
  *
  * Capabilities: stored in LMDB under __capabilities key.
  * Tools and system prompt built dynamically from stored capabilities.
- * Falls back to hardcoded SQL tool if no capabilities stored (backward compat).
  *
- * Env: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, EMPLOYEE_DB, ACTOR_LMDB_PATH,
- *      ACTOR_CORRELATION_ID
- * Deps: libcurl, liblmdb, libsqlite3, mpack, cJSON
+ * PII: set PII_ENABLED=1 to use _masked topic suffixes.
+ *
+ * Env: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, ACTOR_LMDB_PATH,
+ *      ACTOR_CORRELATION_ID, PII_ENABLED
  */
 
 #include "cJSON.h"
 #include "mpack.h"
 #include <curl/curl.h>
 #include <lmdb.h>
-#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_IN      (256 * 1024)
 #define MAX_RESP    (2   * 1024 * 1024)
-#define MAX_STATE   (512 * 1024)
-#define MAX_SCHEMA  (64  * 1024)
-#define MAX_META    (8   * 1024)
 #define MAX_SYS     (128 * 1024)
 #define MAX_ROWS_J  (128 * 1024)
 #define MAX_CAPS    (64  * 1024)
@@ -41,16 +37,13 @@
 static char   g_in[MAX_IN];
 static char   g_resp[MAX_RESP];
 static size_t g_resp_len;
-static char   g_state_buf[MAX_STATE];
-static char   g_schema[MAX_SCHEMA];
-static char   g_depts[MAX_META];
-static char   g_titles[MAX_META];
 static char   g_sys[MAX_SYS];
 static char   g_rows_json[MAX_ROWS_J];
 static char   g_query[MAX_IN];
 static char   g_out[MAX_OUT];
-static char   g_caps[MAX_CAPS];     /* stored capabilities JSON */
-static char   g_tool_topic[64];     /* topic for current tool call */
+static char   g_caps[MAX_CAPS];
+static char   g_tool_topic[64];
+static char   g_tool_args[8192];    /* serialized tool arguments */
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -117,78 +110,18 @@ static int dedup_check(MDB_env* env, const char* tuple_id) {
 
 /* ── Forward decls ───────────────────────────────────────────────────────── */
 
-static void make_system_prompt(const char* db_path);
+static void make_system_prompt(void);
 static cJSON* make_tools(void);
 static void emit_sql_query(const char* sql);
 static void emit_answer(const char* answer);
 static void decode_rows_to_json(mpack_reader_t* r);
 static void save_state(MDB_env* env, const char* key, cJSON* history, cJSON* messages, int round);
 static const char* openai_chat(const char* base_url, const char* api_key, const char* model, cJSON* messages, cJSON* tools);
-static void db_meta(const char* db_path);
 
-/* ── DB Meta ─────────────────────────────────────────────────────────────── */
-
-static void db_meta(const char* db_path) {
-    sqlite3* db;
-    if (sqlite3_open(db_path, &db)) return;
-
-    g_schema[0] = g_depts[0] = g_titles[0] = '\0';
-
-    sqlite3_stmt* stmt;
-    if (!sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql NOT NULL ORDER BY name", -1, &stmt, NULL)) {
-        size_t len = 0;
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char* s = (const char*)sqlite3_column_text(stmt, 0);
-            if (s) {
-                size_t sl = strlen(s);
-                if (len + sl + 2 < MAX_SCHEMA) {
-                    memcpy(g_schema + len, s, sl); len += sl;
-                    g_schema[len++] = '\n';
-                }
-            }
-        }
-        g_schema[len] = '\0';
-        sqlite3_finalize(stmt);
-    }
-
-    if (!sqlite3_prepare_v2(db, "SELECT DISTINCT dept_name FROM departments ORDER BY dept_name LIMIT 50", -1, &stmt, NULL)) {
-        size_t len = 0;
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char* s = (const char*)sqlite3_column_text(stmt, 0);
-            if (s) {
-                size_t sl = strlen(s);
-                if (len + sl + 3 < MAX_META) {
-                    memcpy(g_depts + len, s, sl); len += sl;
-                    g_depts[len++] = ','; g_depts[len++] = ' ';
-                }
-            }
-        }
-        if (len > 1) g_depts[len - 2] = '\0';
-        sqlite3_finalize(stmt);
-    }
-
-    if (!sqlite3_prepare_v2(db, "SELECT DISTINCT title FROM titles ORDER BY title LIMIT 50", -1, &stmt, NULL)) {
-        size_t len = 0;
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char* s = (const char*)sqlite3_column_text(stmt, 0);
-            if (s) {
-                size_t sl = strlen(s);
-                if (len + sl + 3 < MAX_META) {
-                    memcpy(g_titles + len, s, sl); len += sl;
-                    g_titles[len++] = ','; g_titles[len++] = ' ';
-                }
-            }
-        }
-        if (len > 1) g_titles[len - 2] = '\0';
-        sqlite3_finalize(stmt);
-    }
-
-    sqlite3_close(db);
-}
 
 /* ── System Prompt ───────────────────────────────────────────────────────── */
 
-static void make_system_prompt(const char* db_path) {
+static void make_system_prompt(void) {
     size_t len = 0;
 
 #define APPEND(s) do { \
@@ -315,10 +248,9 @@ static const char* find_tool_topic(const char* tool_name) {
     return "sql_query";
 }
 
-/* ── mpack: decode sql_result rows into g_rows_json ─────────────────────── */
+/* ── decode helpers ── */
 
 
-/* ── mpack: decode sql_result rows into g_rows_json ─────────────────────── */
 
 static void decode_rows_to_json(mpack_reader_t* r) {
     size_t len = 0;
@@ -362,13 +294,10 @@ static void decode_rows_to_json(mpack_reader_t* r) {
 
 static void emit_sql_query(const char* sql) {
     const char* topic = find_tool_topic("query_db");
-    /* Add _masked suffix if PII mode is enabled */
     static char topic_buf[80];
     const char* pii = getenv("PII_ENABLED");
-    if (pii && strcmp(pii, "1") == 0) {
-        snprintf(topic_buf, sizeof(topic_buf), "%s_masked", topic);
-        topic = topic_buf;
-    }
+    if (pii && strcmp(pii, "1") == 0) { snprintf(topic_buf, sizeof(topic_buf), "%s_masked", topic); topic = topic_buf; }
+    /* Pack arguments as mpack map (generic: whatever tool expects) */
     mpack_writer_t w;
     mpack_writer_init(&w, g_out, sizeof(g_out));
     mpack_start_map(&w, 2);
@@ -463,7 +392,6 @@ int main(void) {
     const char* base_url = getenv("LLM_BASE_URL"); if (!base_url) base_url = "https://api.deepseek.com";
     const char* api_key  = getenv("LLM_API_KEY");
     const char* model    = getenv("LLM_MODEL");    if (!model)    model    = "deepseek-chat";
-    const char* db_path  = getenv("EMPLOYEE_DB");  if (!db_path)  db_path  = "./employee.db";
 
     if (!corr_id || !*corr_id) { emit_answer("internal error: no correlation id"); return 1; }
 
@@ -502,8 +430,19 @@ int main(void) {
     }
     mpack_reader_destroy(&rdr);
 
-    /* Handle _tool_list: store capabilities in LMDB */
+    /* Handle _tool_list: store capabilities JSON from registry */
     if (strcmp(in_type, "_tool_list") == 0) {
+        /* Decode payload: {type, capabilities: [...]} */
+        static const char* ck[] = { "capabilities" };
+        bool cf[1] = { false };
+        uint32_t csz = mpack_expect_map_max(&rdr, 4);
+        for (uint32_t i = 0; i < csz && mpack_reader_error(&rdr) == mpack_ok; i++) {
+            switch (mpack_expect_key_cstr(&rdr, ck, cf, 1)) {
+                case 0: decode_rows_to_json(&rdr); break;  /* stores in g_rows_json */
+                default: mpack_discard(&rdr); break;
+            }
+        }
+        mpack_done_map(&rdr);
         if (g_rows_json[0] && env) { state_save(env, "__capabilities", g_rows_json); }
         fprintf(stderr, "[llm-agent] capabilities updated\n");
         if (env) mdb_env_close(env); return 0;
@@ -540,7 +479,7 @@ int main(void) {
         if (last_tc_id) cJSON_AddStringToObject(tool_msg, "tool_call_id", cJSON_GetStringValue(last_tc_id));
         cJSON_AddItemToArray(messages, tool_msg);
     } else {
-        make_system_prompt(db_path);
+        make_system_prompt();
         if (stored) { history = cJSON_DetachItemFromObject(stored, "history"); cJSON_Delete(stored); }
         if (!history) history = cJSON_CreateArray();
         cJSON* user_entry = cJSON_CreateObject();
