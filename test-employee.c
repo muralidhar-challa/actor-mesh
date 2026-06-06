@@ -73,7 +73,7 @@ int main(void) {
         "ACTOR_HEARTBEAT_MS=2000","ACTOR_RETRY_MAX=3",
         "ACTOR_ID=tool-registry","ACTOR_TOPIC=_tool_announce,_tool_discover",
         "ACTOR_RESULT_TOPIC=_tool_list",
-        "ACTOR_HANDLER=examples/employee-mesh/handlers/registry/tool-registry.sh",
+        "ACTOR_HANDLER=python3 examples/employee-mesh/handlers/registry/tool-registry.py",
         "ACTOR_LMDB_PATH=/tmp/em-test/reg", blib, NULL};
     pid_t rpid = sp(rargs, renv); ms(600);
     PASS();
@@ -113,14 +113,7 @@ int main(void) {
     CHECK(f != NULL, "tools not announced to registry");
     if (f) fclose(f);
 
-    /* Trigger registry to publish _tool_list so agent discovers tools */
-    TEST("tool discovery");
-    uint8_t dm[] = {0x81,0xa4,'t','y','p','e',0xae,'_','t','o','o','l','_','d','i','s','c','o','v','e','r'};
-    send_msg("_tool_discover", dm, sizeof(dm));
-    ms(500);
-    PASS();
-
-    /* ── Start agent ── */
+    /* ── Start agent FIRST (so it can receive _tool_list) ── */
     TEST("agent");
     char *aargs[] = {"./actor", NULL};
     char model_env[128] = "LLM_MODEL=granite4.1:8b";
@@ -132,7 +125,14 @@ int main(void) {
         "ACTOR_HANDLER=examples/employee-mesh/handlers/agents/llm-agent",
         "ACTOR_LMDB_PATH=/tmp/em-test/ag",
         "LLM_BASE_URL=http://localhost:11434", model_env, NULL};
-    pid_t apid = sp(aargs, aenv); ms(2000); /* give agent time to load tools */
+    pid_t apid = sp(aargs, aenv); ms(1000);
+    PASS();
+
+    /* ── Discover tools (agent receives _tool_list) ── */
+    TEST("tool discovery");
+    uint8_t dm[] = {0x81,0xa4,'t','y','p','e',0xae,'_','t','o','o','l','_','d','i','s','c','o','v','e','r'};
+    send_msg("_tool_discover", dm, sizeof(dm));
+    ms(1000); /* wait for agent to process _tool_list */
     PASS();
 
     /* ── Send query ── */
