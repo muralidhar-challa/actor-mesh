@@ -5,7 +5,7 @@
 # Output: topic_prefix\n + mpack result
 
 # --- step 1: extract argument from mpack ---
-VAL=$(handlers/mpack-get "${MCP_ARGS:-sql}" 2>/dev/null)
+VAL=$(handlers/lib/mpack-get "${MCP_ARGS:-sql}" 2>/dev/null)
 [ -z "$VAL" ] && exit 0
 
 # --- step 2: build MCP request ---
@@ -21,4 +21,4 @@ TEXT=$(echo "$RESPONSE" | sed 's/.*"text":"//;s/"}].*//;s/\\"/"/g;s/\\n/\
 
 # --- step 5: emit as mesh result ---
 printf "sql_result\n"
-handlers/mpack-pack "text" "$TEXT"
+handlers/lib/mpack-pack "text" "$TEXT"

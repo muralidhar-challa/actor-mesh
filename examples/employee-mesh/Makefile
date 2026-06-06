@@ -20,7 +20,7 @@ LIBS         = -lnng -llmdb
 HANDLER_LIBS = -lcurl -llmdb -lsqlite3
 
 NER_MODEL    ?= $(abspath ../../models/ner.onnx)
-NER_INCS     = -I$(ROOT)/vendor/smhasher -I$(ROOT) -I/usr/include/onnxruntime
+NER_INCS     = -I$(ROOT)/vendor/smhasher -Ihandlers/lib -I$(ROOT) -I/usr/include/onnxruntime
 NER_LIBS     = -lonnxruntime -lstdc++
 SMHASHER     = $(ROOT)/vendor/smhasher/MurmurHash2.cpp
 
@@ -35,16 +35,16 @@ PROXY      = $(ROOT)/mesh-proxy
 
 all: handlers
 
-handlers: handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
+handlers: handlers/agents/llm-agent handlers/tools/sqlite-tool handlers/tools/pii-filter
 
-handlers/llm-agent: handlers/llm-agent.c $(MPACK_SRCS) $(CJSON)
-	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
+handlers/agents/llm-agent: handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON)
+	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
 
-handlers/sqlite-tool: handlers/sqlite-tool.c $(MPACK_SRCS)
-	$(CC) $(CFLAGS) handlers/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o $@
+handlers/tools/sqlite-tool: handlers/tools/sqlite-tool.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) handlers/tools/sqlite-tool.c $(MPACK_SRCS) -lsqlite3 -o $@
 
-handlers/pii-filter: handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER)
-	$(CXX) $(CFLAGS) $(NER_INCS) handlers/pii-filter.c $(MPACK_SRCS) $(SMHASHER) $(HANDLER_LIBS) $(NER_LIBS) -o $@
+handlers/tools/pii-filter: handlers/tools/pii-filter.c $(MPACK_SRCS) $(SMHASHER)
+	$(CXX) $(CFLAGS) $(NER_INCS) handlers/tools/pii-filter.c $(MPACK_SRCS) $(SMHASHER) $(HANDLER_LIBS) $(NER_LIBS) -o $@
 
 client: client.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) client.c $(MPACK_SRCS) $(LIBS) -o $@
@@ -56,7 +56,7 @@ ui:
 	@cd ui && npm install && gcc -Wall -O2 -std=c11 bridge.c -lnng -o src-tauri/bridge && echo "[ui] ready"
 
 clean:
-	rm -f client tui handlers/llm-agent handlers/sqlite-tool handlers/pii-filter
+	rm -f client tui handlers/agents/llm-agent handlers/tools/sqlite-tool handlers/tools/pii-filter
 	cd ui && rm -rf src-tauri/target src-tauri/bridge node_modules 2>/dev/null; true
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/tokenise
 	@$(COMMON_ENV) ACTOR_ID=tokenise-1 \
 		ACTOR_TOPIC=user_message,sql_result ACTOR_RESULT_TOPIC=user_message_masked \
-		ACTOR_HANDLER=$(abspath handlers/pii-filter) ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
+		ACTOR_HANDLER=$(abspath handlers/tools/pii-filter) ACTOR_LMDB_PATH=$(LMDB_BASE)/tokenise \
 		PII_MODE=mask NER_MODEL_PATH=$(NER_MODEL) TOKENMAP_PATH=$(TOKENMAP_PATH) \
 		$(ACTOR) >>$(LOGDIR)/tokenise.log 2>&1 &
 	@sleep 0.2
@@ -107,7 +107,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/detokenise
 	@$(COMMON_ENV) ACTOR_ID=detokenise-1 \
 		ACTOR_TOPIC=sql_query_masked,agent_response_masked ACTOR_RESULT_TOPIC=agent_response \
-		ACTOR_HANDLER=$(abspath handlers/pii-filter) ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
+		ACTOR_HANDLER=$(abspath handlers/tools/pii-filter) ACTOR_LMDB_PATH=$(LMDB_BASE)/detokenise \
 		PII_MODE=restore TOKENMAP_PATH=$(TOKENMAP_PATH) \
 		$(ACTOR) >>$(LOGDIR)/detokenise.log 2>&1 &
 	@sleep 0.2
@@ -117,7 +117,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/sqlite-tool
 	@$(COMMON_ENV) ACTOR_ID=sqlite-tool-1 \
 		ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result \
-		ACTOR_HANDLER=$(abspath handlers/sqlite-tool) ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
+		ACTOR_HANDLER=$(abspath handlers/tools/sqlite-tool) ACTOR_LMDB_PATH=$(LMDB_BASE)/sqlite-tool \
 		EMPLOYEE_DB=$(EMPLOYEE_DB) \
 		$(ACTOR) >>$(LOGDIR)/sqlite-tool.log 2>&1 &
 	@sleep 0.2
@@ -127,7 +127,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/llm-agent
 	@$(COMMON_ENV) ACTOR_ID=llm-agent-1 \
 		ACTOR_TOPIC=user_message_masked,sql_result_masked ACTOR_RESULT_TOPIC=sql_query_masked \
-		ACTOR_HANDLER=$(abspath handlers/llm-agent) ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
+		ACTOR_HANDLER=$(abspath handlers/agents/llm-agent) ACTOR_LMDB_PATH=$(LMDB_BASE)/llm-agent \
 		LLM_BASE_URL=$(LLM_BASE_URL) LLM_API_KEY=$(LLM_API_KEY) LLM_MODEL=$(LLM_MODEL) \
 		EMPLOYEE_DB=$(EMPLOYEE_DB) \
 		$(ACTOR) >>$(LOGDIR)/llm-agent.log 2>&1 &
@@ -138,7 +138,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/shell-exec
 	@$(COMMON_ENV) ACTOR_ID=shell-exec-1 \
 		ACTOR_TOPIC=shell_exec ACTOR_RESULT_TOPIC=shell_result \
-		ACTOR_HANDLER=$(abspath handlers/shell-exec) ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
+		ACTOR_HANDLER=$(abspath handlers/tools/shell-exec) ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
 		$(ACTOR) >>$(LOGDIR)/shell-exec.log 2>&1 &
 	@sleep 0.2
 	@echo "[actor] shell-exec started"

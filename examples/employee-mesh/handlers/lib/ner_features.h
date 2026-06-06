@@ -21,7 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
-#include "../../../vendor/smhasher/MurmurHash2.h"
+#include "../../../../vendor/smhasher/MurmurHash2.h"
 
 /* ── limits ───────────────────────────────────────────────────────────────── */
 
