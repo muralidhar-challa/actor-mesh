@@ -1,5 +1,5 @@
-#include <unistd.h>
 #define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
 /* test-employee.c — full employee mesh integration test
  * Starts: proxy + registry + SQLite MCP + agent
  * Announces tools, sends query, waits for agent response.
@@ -113,6 +113,13 @@ int main(void) {
     CHECK(f != NULL, "tools not announced to registry");
     if (f) fclose(f);
 
+    /* Trigger registry to publish _tool_list so agent discovers tools */
+    TEST("tool discovery");
+    uint8_t dm[] = {0x81,0xa4,'t','y','p','e',0xae,'_','t','o','o','l','_','d','i','s','c','o','v','e','r'};
+    send_msg("_tool_discover", dm, sizeof(dm));
+    ms(500);
+    PASS();
+
     /* ── Start agent ── */
     TEST("agent");
     char *aargs[] = {"./actor", NULL};
@@ -125,7 +132,7 @@ int main(void) {
         "ACTOR_HANDLER=examples/employee-mesh/handlers/agents/llm-agent",
         "ACTOR_LMDB_PATH=/tmp/em-test/ag",
         "LLM_BASE_URL=http://localhost:11434", model_env, NULL};
-    pid_t apid = sp(aargs, aenv); ms(1000);
+    pid_t apid = sp(aargs, aenv); ms(2000); /* give agent time to load tools */
     PASS();
 
     /* ── Send query ── */
@@ -140,6 +147,22 @@ int main(void) {
     if (n > 0) {
         buf[n] = 0;
         printf("  agent says: %.*s...\n", n < 100 ? (int)n : 100, buf);
+    }
+
+    /* ── Tool calling: agent uses SQLite MCP ── */
+    TEST("agent tool call (60s timeout)");
+    {
+        /* Send a query that requires SQL: "how many employees?" */
+        uint8_t qm[] = {0x82,0xa4,'t','y','p','e',0xad,'u','s','e','r','_','m','e','s','s','a','g','e',
+            0xa5,'q','u','e','r','y',0xb1,'h','o','w',' ','m','a','n','y',' ','e','m','p','l','o','y','e','e','s',' ','a','r','e',' ','t','h','e','r','e','?'};
+        send_msg("user_message", qm, sizeof(qm));
+        uint8_t buf[4096];
+        ssize_t n = wait_msg("agent_response", buf, sizeof(buf)-1, 120000);
+        CHECK(n > 0, "no agent response to SQL query (Ollama running?)");
+        if (n > 0) {
+            buf[n] = 0;
+            printf("  agent: %.*s\n", n < 150 ? (int)n : 150, buf);
+        }
     }
 
     /* ── Cleanup ── */
