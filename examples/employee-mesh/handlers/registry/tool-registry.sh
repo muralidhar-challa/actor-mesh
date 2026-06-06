@@ -3,8 +3,8 @@
 # Stores tools in $ACTOR_LMDB_PATH/tools/<actor>.json
 # Gets absolute path to mpack-get based on script location
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MPACK_GET="$SCRIPT_DIR/../lib/mpack-get"
+# BRIDGE_LIB must be set to the lib/ directory path
+MPACK_GET="${BRIDGE_LIB:-.}/mpack-get"
 LMDB="${ACTOR_LMDB_PATH:-/tmp/tool-registry}"
 TOOLS_DIR="$LMDB/tools"
 mkdir -p "$TOOLS_DIR"

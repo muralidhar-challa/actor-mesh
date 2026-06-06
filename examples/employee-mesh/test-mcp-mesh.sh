@@ -3,7 +3,6 @@
 # Starts proxy + registry + SQLite MCP + agent, sends query, waits for response.
 # Usage: LLM_MODEL=granite4.1:8b bash test-mcp-mesh.sh
 
-set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT/examples/employee-mesh"
 
@@ -16,7 +15,9 @@ LMDB="/tmp/mcp-test"
 QUERY="${1:-how many employees are there?}"
 
 echo "=== cleaning up ==="
-pkill -9 mesh-proxy actor 2>/dev/null; sleep 0.3
+pkill -9 mesh-proxy 2>/dev/null || true
+pkill -9 actor 2>/dev/null || true
+sleep 0.3
 rm -rf "$LMDB"
 mkdir -p "$LMDB"/{reg,db,ag}
 
