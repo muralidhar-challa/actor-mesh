@@ -371,9 +371,10 @@ static const char* openai_chat(const char* base_url, const char* api_key,
     cJSON* body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "model", model);
     cJSON_AddItemToObject(body, "messages", cJSON_Duplicate(messages, 1));
-    if (tools && cJSON_GetArraySize(tools) > 0)
+    if (tools && cJSON_GetArraySize(tools) > 0) {
         cJSON_AddItemToObject(body, "tools", cJSON_Duplicate(tools, 1));
-    if (tools) cJSON_AddStringToObject(body, "tool_choice", "auto");
+        cJSON_AddStringToObject(body, "tool_choice", "auto");
+    }
 
     char* post = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
