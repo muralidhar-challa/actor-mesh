@@ -4,7 +4,7 @@
  *
  * Receives: mpack user_message  {type, query}
  *           mpack sql_result    {type, rows:[{col:val,...},...]}
- *           mpack _cap_list     {type, capabilities:[{actor,capabilities:[...]}]}
+ *           mpack _tool_list     {type, capabilities:[{actor,capabilities:[...]}]}
  *
  * Emits:    <tool_topic>\n  mpack {type:"...", ...}
  *        or agent_response\n mpack {type:"agent_response_masked", answer:"..."}
@@ -528,8 +528,8 @@ int main(void) {
     }
     mpack_reader_destroy(&rdr);
 
-    /* Handle _cap_list: store capabilities in LMDB */
-    if (strcmp(in_type, "_cap_list") == 0) {
+    /* Handle _tool_list: store capabilities in LMDB */
+    if (strcmp(in_type, "_tool_list") == 0) {
         if (g_rows_json[0] && env) { state_save(env, "__capabilities", g_rows_json); }
         fprintf(stderr, "[llm-agent] capabilities updated\n");
         if (env) mdb_env_close(env); return 0;

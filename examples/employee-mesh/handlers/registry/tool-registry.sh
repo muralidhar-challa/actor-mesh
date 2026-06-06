@@ -1,34 +1,33 @@
 #!/bin/sh
-# tool-registry.sh — auto-discovers MCP tools on the mesh
-# Saves stdin to temp file, extracts mpack fields via mpack-get.
-# Stores tools in $ACTOR_LMDB_PATH/tools/<name>.json
+# tool-registry.sh — generic capability discovery (shell-only)
+# Stores capabilities in $ACTOR_LMDB_PATH/caps/<actor>.json
+# Input: mpack via stdin
 
 LMDB="${ACTOR_LMDB_PATH:-/tmp/tool-registry}"
-mkdir -p "$LMDB/tools"
+caps_DIR="$LMDB/caps"
+mkdir -p "$caps_DIR"
 
-# Save stdin to temp file (binary-safe)
+BIN="$(dirname "$0")/../lib/mpack-get"
 TMP=$(mktemp)
 cat > "$TMP"
 
-TYPE=$(../lib/mpack-get type < "$TMP" 2>/dev/null)
+TYPE=$("$BIN" type < "$TMP" 2>/dev/null)
 
 case "$TYPE" in
     _tool_announce)
-        NAME=$(../lib/mpack-get name < "$TMP" 2>/dev/null)
-        if [ -n "$NAME" ]; then
-            TOOLS=$(../lib/mpack-get tools < "$TMP" 2>/dev/null)
-            echo "{\"name\":\"$NAME\",\"tools\":$TOOLS}" > "$LMDB/tools/${NAME}.json"
-        fi
+        ACTOR=$("$BIN" actor < "$TMP" 2>/dev/null)
+        caps=$("$BIN" -j capabilities < "$TMP" 2>/dev/null)
+        [ -n "$ACTOR" ] && [ -n "$caps" ] && echo "{\"actor\":\"$ACTOR\",\"capabilities\":$caps}" > "$caps_DIR/${ACTOR}.json"
         ;;
-    _tools_list)
-        printf "_tools_list\n"
-        printf '{"type":"_tools_list","tools":['
-        FIRST=1
-        for f in "$LMDB/tools"/*.json; do
+    _tool_discover)
+        printf "_tool_list\n"
+        printf '{"type":"_tool_list","capabilities":['
+        first=1
+        for f in "$caps_DIR"/*.json; do
             [ -f "$f" ] || continue
-            [ $FIRST -eq 1 ] || printf ','
+            [ $first -eq 1 ] || printf ','
             cat "$f"
-            FIRST=0
+            first=0
         done
         printf ']}\n'
         ;;
