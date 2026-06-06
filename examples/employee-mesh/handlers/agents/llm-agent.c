@@ -232,19 +232,8 @@ static void make_system_prompt(const char* db_path) {
         return;
     }
 
-    /* ── Fallback: hardcoded employee DB prompt ── */
-    db_meta(db_path);
-
-    APPEND("You are an HR assistant. You MUST call query_db for every question. Never answer from memory.\n\n");
-    APPEND("Token Semantics: TOK_ strings are opaque identifiers. Copy them exactly.\n\n");
-    APPEND("Schema:\n"); APPEND(g_schema); APPEND("\n\n");
-    APPEND("Departments: "); APPEND(g_depts); APPEND("\n");
-    APPEND("Titles: ");     APPEND(g_titles); APPEND("\n\n");
-    APPEND("Rules:\n");
-    APPEND("- Always JOIN departments to filter by dept_name.\n");
-    APPEND("- Always use LIKE for name matching.\n");
-    APPEND("- Always use to_date='9999-01-01' for current records.\n");
-    APPEND("- Always LIMIT 20.\n");
+    /* ── Default: no tools registered ── */
+    APPEND("You are a helpful assistant. No tools are currently available.\n");
 
 #undef APPEND
     g_sys[len] = '\0';
@@ -288,32 +277,8 @@ static cJSON* make_tools(void) {
         cJSON_Delete(tools_arr);
     }
 
-    /* ── Fallback: hardcoded query_db tool ── */
-    cJSON* tools = cJSON_CreateArray();
-    cJSON* t     = cJSON_CreateObject();
-    cJSON* fn    = cJSON_CreateObject();
-    cJSON* params= cJSON_CreateObject();
-    cJSON* props = cJSON_CreateObject();
-    cJSON* sql_p = cJSON_CreateObject();
-    cJSON* req   = cJSON_CreateArray();
-
-    cJSON_AddStringToObject(sql_p, "type",        "string");
-    cJSON_AddStringToObject(sql_p, "description", "SQLite query with LIMIT 20");
-    cJSON_AddItemToObject(props, "sql", sql_p);
-    cJSON_AddStringToObject(params, "type", "object");
-    cJSON_AddItemToObject(params, "properties", props);
-    cJSON_AddItemToArray(req, cJSON_CreateString("sql"));
-    cJSON_AddItemToObject(params, "required", req);
-
-    cJSON_AddStringToObject(fn, "name", "query_db");
-    cJSON_AddStringToObject(fn, "description",
-        "Execute a SQLite query against the employee database. Always include LIMIT 20.");
-    cJSON_AddItemToObject(fn, "parameters", params);
-
-    cJSON_AddStringToObject(t, "type", "function");
-    cJSON_AddItemToObject(t, "function", fn);
-    cJSON_AddItemToArray(tools, t);
-    return tools;
+    /* ── Default: no tools registered ── */
+    return cJSON_CreateArray();
 }
 
 /* ── Lookup tool topic from capabilities ─────────────────────────────────── */
