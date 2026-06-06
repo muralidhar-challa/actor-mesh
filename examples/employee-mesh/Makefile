@@ -138,7 +138,7 @@ run-ui: stop
 	@mkdir -p $(LMDB_BASE)/shell-exec
 	@$(COMMON_ENV) ACTOR_ID=shell-exec-1 \
 		ACTOR_TOPIC=shell_exec ACTOR_RESULT_TOPIC=shell_result \
-		ACTOR_HANDLER=$(abspath handlers/tools/shell-exec) ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
+		ACTOR_HANDLER=$(abspath handlers/tools/shell-exec.sh) ACTOR_LMDB_PATH=$(LMDB_BASE)/shell-exec \
 		$(ACTOR) >>$(LOGDIR)/shell-exec.log 2>&1 &
 	@sleep 0.2
 	@echo "[actor] shell-exec started"

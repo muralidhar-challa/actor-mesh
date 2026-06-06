@@ -161,12 +161,33 @@ static void make_system_prompt(void) {
         }
         if (caps) cJSON_Delete(caps);
         APPEND("\nUse tools when appropriate. Call tools by their exact name.\n");
+
+        /* PII token handling instructions */
+        const char* pii = getenv("PII_ENABLED");
+        if (pii && strcmp(pii, "1") == 0) {
+            APPEND("\n─── Token Handling ───\n");
+            APPEND("Strings matching TOK_[A-Z]+_[0-9]+ (e.g. TOK_PERSON_0001, TOK_ORG_0000)\n");
+            APPEND("are opaque identifiers representing sensitive data.\n");
+            APPEND("Rules:\n");
+            APPEND("- Copy tokens character-for-character. Never modify, reformat, truncate,\n");
+            APPEND("  or paraphrase them. Preserve exact uppercase and underscores.\n");
+            APPEND("- In SQL: use tokens exactly as-is (e.g. WHERE first_name='TOK_PERSON_0001').\n");
+            APPEND("- In responses: reproduce tokens character-for-character as they appear.\n");
+            APPEND("- Do NOT mention, explain, or decode tokens to the user.\n");
+            APPEND("- Treat tokens as literal string values in all contexts.\n");
+        }
+
         g_sys[len] = '\0';
         return;
     }
 
     /* ── Default: no tools registered ── */
     APPEND("You are a helpful assistant. No tools are currently available.\n");
+
+    const char* pii = getenv("PII_ENABLED");
+    if (pii && strcmp(pii, "1") == 0) {
+        APPEND("\nToken Handling: Strings like TOK_PERSON_0001 are opaque. Copy exactly, never modify.\n");
+    }
 
 #undef APPEND
     g_sys[len] = '\0';
