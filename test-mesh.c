@@ -190,9 +190,31 @@ static void t9(void){ TEST("registry: store tool");
     kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
 }
 
+static void t10(void){ TEST("heartbeat: actors emit");
+    free_ports(); cleanup();
+    char *a[]={"./mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    pid_t pp=sp(a,e); ms(600);
+    system("mkdir -p /tmp/tm10");
+    char *aa[]={"./actor",NULL},*ae[]={
+        "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
+        "ACTOR_HEARTBEAT_MS=500","ACTOR_ID=hb","ACTOR_TOPIC=none","ACTOR_RESULT_TOPIC=ignored",
+        "ACTOR_HANDLER=sh -c 'echo ignored; echo ok'","ACTOR_LMDB_PATH=/tmp/tm10",NULL};
+    pid_t ap=sp(aa,ae); ms(1200); /* wait for at least 2 heartbeats */
+    /* Subscribe to heartbeat and check we got at least one */
+    nng_socket s; nng_sub0_open(&s); nng_dial(s, SP, NULL, 0);
+    nng_socket_set(s, NNG_OPT_SUB_SUBSCRIBE, "heartbeat", 9);
+    nng_socket_set_ms(s, "recv-timeout", 2000);
+    nng_msg *m=NULL; int got=0;
+    for(int i=0;i<3;i++){ if(nng_recvmsg(s,&m,0)==0){got++; if(m)nng_msg_free(m);} }
+    nng_close(s);
+    CHECK(got>0,"no heartbeat received");
+    if(got>0) printf("  received %d heartbeat(s)\n", got);
+    kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
+}
+
 int main(void){
     printf("Actor Mesh Test Suite\n\n");
-    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9();
-    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,9);
+    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10();
+    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,10);
     cleanup(); return failures;
 }
