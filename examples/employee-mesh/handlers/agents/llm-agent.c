@@ -427,7 +427,8 @@ int main(void) {
     const char* tuple_id = getenv("ACTOR_TUPLE_ID");
     if (dedup_check(env, tuple_id)) {
         fprintf(stderr, "[llm-agent] dedup: skipping already-seen tuple %s\n", tuple_id);
-        if (env) mdb_env_close(env); return 0;
+        if (env) mdb_env_close(env);
+        return 0;
     }
 
     /* decode mpack input */
@@ -467,7 +468,8 @@ int main(void) {
         mpack_done_map(&rdr);
         if (g_rows_json[0] && env) { state_save(env, "__capabilities", g_rows_json); }
         fprintf(stderr, "[llm-agent] capabilities updated\n");
-        if (env) mdb_env_close(env); return 0;
+        if (env) mdb_env_close(env);
+        return 0;
     }
 
     cJSON* history  = NULL;
