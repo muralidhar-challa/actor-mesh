@@ -69,18 +69,19 @@ LLM_BASE_URL ?= https://api.deepseek.com
 LLM_API_KEY  ?=
 LLM_MODEL    ?= deepseek-chat
 
-COMMON_ENV = ACTOR_BUS_SUB=$(BUS_SUB) ACTOR_BUS_PUB=$(BUS_PUB) ACTOR_HEARTBEAT_MS=2000 ACTOR_RETRY_MAX=3
+COMMON_ENV = ACTOR_BUS_SUB=$(BUS_SUB) ACTOR_BUS_PUB=$(BUS_PUB) ACTOR_HEARTBEAT_MS=2000 ACTOR_RETRY_MAX=3 BRIDGE_LIB=$(abspath handlers/lib)
 
 # ── Run (full PII pipeline) ────────────────────────────────────────────────
 
 .PHONY: stop run-ui
 
 stop:
+	@fuser -k 5557/tcp 5556/tcp 2>/dev/null; true
 	@pkill -9 mesh-proxy 2>/dev/null; true
 	@pkill -9 actor 2>/dev/null; true
 	@pkill -9 actor-mesh-desktop 2>/dev/null; true
-	@rm -rf $(LMDB_BASE)
-	@echo "[mesh] stopped"
+	@rm -rf $(LMDB_BASE) /tmp/mcp-test 2>/dev/null; true
+	@echo "[mesh] stopped — ports freed, LMDB wiped"
 
 run-ui: stop
 	@# proxy
