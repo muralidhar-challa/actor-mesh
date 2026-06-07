@@ -17,6 +17,7 @@ book:
     - durability.qmd
     - composition.qmd
     - agents.qmd
+    - multi-agent.qmd
     - reference.qmd
     - appendix.qmd
 
