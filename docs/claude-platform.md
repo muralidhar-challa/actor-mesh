@@ -10,7 +10,7 @@
 2. **Workbench** → Create new agent
 3. Configure:
    - **System Prompt**: Agent's role, personality, rules
-   - **Model**: Claude Sonnet 4 (recommended for agents) or Opus 4
+   - **Model**: Claude Sonnet 4 (cost/performance), Haiku 3.5 (fast/cheap)
    - **Tools**: MCP servers or custom tool definitions
    - **Temperature**: 0.0 for deterministic, 0.3 for creative
 4. **Deploy** → API endpoint or embedded chat
