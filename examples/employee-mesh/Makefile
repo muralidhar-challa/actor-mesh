@@ -26,8 +26,8 @@ SMHASHER     = $(ROOT)/vendor/smhasher/MurmurHash2.cpp
 
 MPACK_SRCS = $(VENDOR)/mpack/mpack-common.c $(VENDOR)/mpack/mpack-platform.c $(VENDOR)/mpack/mpack-reader.c $(VENDOR)/mpack/mpack-writer.c $(VENDOR)/mpack/mpack-expect.c $(VENDOR)/mpack/mpack-node.c
 CJSON      = $(VENDOR)/cjson/cJSON.c
-ACTOR      = $(ROOT)/actor
-PROXY      = $(ROOT)/mesh-proxy
+ACTOR      = $(ROOT)/bin/actor
+PROXY      = $(ROOT)/bin/mesh-proxy
 
 # ── Build ──────────────────────────────────────────────────────────────────
 

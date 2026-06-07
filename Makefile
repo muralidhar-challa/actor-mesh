@@ -42,15 +42,18 @@ endif
 
 all: actor mesh-proxy
 
-actor: runtime/main.c runtime/actor.c runtime/actor.h \
-       runtime/actor_tuple.h runtime/actor_uuid.h
-	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o actor
+bin/:
+	mkdir -p bin
 
-mesh-proxy: proxy/proxy.c
-	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o mesh-proxy
+actor: runtime/main.c runtime/actor.c runtime/actor.h \
+       runtime/actor_tuple.h runtime/actor_uuid.h | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o bin/actor
+
+mesh-proxy: proxy/proxy.c | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o bin/mesh-proxy
 
 clean:
-	rm -f actor mesh-proxy
+	rm -rf bin/
 
 # Cross-compile convenience targets — use with CC=zig or CC=clang + sysroot
 # Cross-compile targets (use CC=zig cc). Linux works out of box.

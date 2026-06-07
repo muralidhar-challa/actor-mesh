@@ -58,14 +58,14 @@ int main(void) {
 
     /* ── Start proxy ── */
     TEST("proxy");
-    char *pargs[] = {"./mesh-proxy", NULL};
+    char *pargs[] = {"bin/mesh-proxy", NULL};
     char *penv[]  = {"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t ppid = sp(pargs, penv); ms(600);
     PASS();
 
     /* ── Start registry ── */
     TEST("registry");
-    char *rargs[] = {"./actor", NULL};
+    char *rargs[] = {"bin/actor", NULL};
     char cwd[1024]; getcwd(cwd, sizeof(cwd));
     char blib[1024]; snprintf(blib, 1024, "BRIDGE_LIB=%s/examples/employee-mesh/handlers/lib", cwd);
     char *renv[] = {
@@ -80,7 +80,7 @@ int main(void) {
 
     /* ── Start SQLite MCP ── */
     TEST("SQLite MCP");
-    char *sargs[] = {"./actor", NULL};
+    char *sargs[] = {"bin/actor", NULL};
     char mcp_srv[1024]; snprintf(mcp_srv, 1024, "MCP_SERVER=python3 %s/examples/employee-mesh/handlers/mcp/mcp-sqlite.py", cwd);
     char emp_db[1024]; snprintf(emp_db, 1024, "EMPLOYEE_DB=%s/examples/employee-mesh/db/employee.db", cwd);
     char *senv[] = {
@@ -115,7 +115,7 @@ int main(void) {
 
     /* ── Start agent FIRST (so it can receive _tool_list) ── */
     TEST("agent");
-    char *aargs[] = {"./actor", NULL};
+    char *aargs[] = {"bin/actor", NULL};
     char model_env[128] = "LLM_MODEL=granite4.1:8b";
     char *aenv[] = {
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
