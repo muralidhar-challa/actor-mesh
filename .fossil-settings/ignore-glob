@@ -19,3 +19,5 @@ __pycache__/
 *.mdb
 test/
 bin/*
+examples/employee-mesh/ui/clay-ui
+examples/employee-mesh/handlers/tools/pii-filter
