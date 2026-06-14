@@ -2,12 +2,15 @@
 #
 # ── Quick start ────────────────────────────────────────────────────────────
 #   make                build handlers
-#   make ui             setup desktop UI deps
+#   make ui             build clay SDL2 desktop UI
 #   make run-ui         start proxy + actors + desktop UI (full PII pipeline)
 #   make stop           kill everything
 #
 # ── LLM key ────────────────────────────────────────────────────────────────
 #   export LLM_API_KEY=sk-... && make run-ui
+#
+# ── Clay SDL2 renderer ─────────────────────────────────────────────────────
+#   git clone --depth=1 https://github.com/nicbarker/clay /tmp/clay
 
 ROOT    = ../..
 RUNTIME = $(ROOT)/runtime
@@ -36,6 +39,8 @@ PROXY      = $(ROOT)/bin/mesh-proxy
 all: handlers
 
 
+
+
 handlers/agents/llm-agent: handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON)
 	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
 
@@ -49,11 +54,23 @@ client: client.c $(MPACK_SRCS)
 tui: tui.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o $@
 
-ui:
-	@cd ui && npm install && gcc -Wall -O2 -std=c11 bridge.c -lnng -o src-tauri/bridge && echo "[ui] ready"
+UI_SRCS = ui/main.c ui/state.c ui/net.c \
+          ui/components/header.c \
+          ui/components/actors.c \
+          ui/components/bus.c \
+          ui/components/publish.c
+
+ui/clay-ui: $(UI_SRCS)
+	$(CC) -Wall -O2 -std=c11 \
+		-Wno-unused-variable -Wno-format-truncation -Wno-parentheses \
+		$(UI_SRCS) \
+		$(shell sdl2-config --cflags --libs) -lSDL2_ttf -lnng \
+		-o ui/clay-ui
+
+ui: ui/clay-ui
 
 clean:
-	cd ui && rm -rf src-tauri/target src-tauri/bridge node_modules 2>/dev/null; true
+	rm -f ui/clay-ui
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -79,7 +96,7 @@ stop:
 	@fuser -k 5557/tcp 5556/tcp 2>/dev/null; true
 	@pkill -9 mesh-proxy 2>/dev/null; true
 	@pkill -9 actor 2>/dev/null; true
-	@pkill -9 actor-mesh-desktop 2>/dev/null; true
+	@pkill -9 clay-ui 2>/dev/null; true
 	@rm -rf $(LMDB_BASE) /tmp/mcp-test 2>/dev/null; true
 	@echo "[mesh] stopped — ports freed, LMDB wiped"
 
@@ -110,10 +127,6 @@ run-ui: stop
 	@sleep 0.2
 	@echo "[actor] detokenise started"
 
-		ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result \
-		EMPLOYEE_DB=$(EMPLOYEE_DB) \
-	@sleep 0.2
-
 	@# llm-agent — receives masked, emits masked
 	@mkdir -p $(LMDB_BASE)/llm-agent
 	@$(COMMON_ENV) ACTOR_ID=llm-agent-1 \
@@ -136,4 +149,4 @@ run-ui: stop
 
 	@echo "[mesh] proxy + 5 actors running (PII pipeline active)"
 	@echo ""
-	@cd ui && GSK_RENDERER=cairo GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 npx tauri dev
+	@cd ui && $(COMMON_ENV) ./clay-ui
