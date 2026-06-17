@@ -15,7 +15,7 @@ static uint8_t g_frame_buf[ACTOR_MAX_PAYLOAD + sizeof(actor_header_t)];
 | actor runtime | ~8 MB | NNG + LMDB mmap + payload BSS |
 | handler invocation | ~4 MB peak | Static BSS + shared libs; exits immediately |
 
-A payload exceeding the cap is dropped with a log message — never `malloc`. Override at build time:
+A payload exceeding the cap publishes a `tuple_rejected` tuple and is never `malloc`'d. Override the cap at build time:
 
 ```bash
 make ACTOR_MAX_PAYLOAD=4194304
@@ -30,7 +30,7 @@ make ACTOR_MAX_PAYLOAD=4194304
 | Fault isolation | A handler that panics or OOMs takes nothing else down. The runtime and bus are unaffected. |
 | Zero-alloc runtime | Static buffers only in the message path. Header cast from raw bytes. Payload in BSS. No heap allocation. |
 | Durable by default | Every tuple is written to LMDB before fork and before publish. A crash at any point is recoverable on restart. |
-| Observable | Every tuple is a published event. Subscribe to `heartbeat` to see the mesh. Subscribe to `*` to see everything. |
+| Observable | Every tuple is a published event. Subscribe to `heartbeat` to monitor liveness. Subscribe to `tuple_rejected` for drop visibility. Subscribe to `*` to see everything. |
 | Composable | Adding an actor to a running mesh requires zero changes to existing actors. Subscribe to a topic, emit on a topic, done. |
 
 ---

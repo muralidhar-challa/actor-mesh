@@ -41,13 +41,27 @@ The proxy is a single NNG device — a sub0 socket forward to a pub0 socket via 
 
 ## The proxy is an actor
 
-The proxy binary is a full actor skeleton — it has its own LMDB environment for routing state when needed. By default it runs in dumb forwarding mode (`nng_device`), but it can also run a handler to do subscription-aware routing using LMDB as a topic trie. Catch-up after restart works the same way: an actor publishes a request to the proxy, the proxy walks its LMDB cursor and streams back missed tuples.
+The proxy is a special-case actor. It has no handler, no LMDB, and no topic subscription — but it participates in the mesh like any other member: it emits on the `heartbeat` topic at `PROXY_HEARTBEAT_MS` intervals and responds to `SIGTERM`/`SIGINT` for clean shutdown. This makes the proxy itself observable and liveness-checkable via the same heartbeat mechanism as all other actors.
 
 ## Endpoints
 
-The proxy is ~57 lines of C. It binds two NNG sockets and forwards between them:
+The proxy binds two NNG sockets and forwards all messages between them in a tight recv → send loop:
 
-- **sub** on `tcp://*:5557` — actors publish here
-- **pub** on `tcp://*:5556` — actors subscribe here
+- **sub** on `tcp://*:5557` — actors and clients publish here
+- **pub** on `tcp://*:5556` — actors and clients subscribe here
 
-Both endpoints are configurable via `PROXY_SUB_BIND` and `PROXY_PUB_BIND`.
+Both endpoints accept multiple transports simultaneously. Bind WebSocket alongside TCP to support browser clients with no extra bridging:
+
+```sh
+PROXY_SUB_BIND=tcp://*:5557,ws://*:8080
+PROXY_PUB_BIND=tcp://*:5556,ws://*:8081
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROXY_SUB_BIND` | `tcp://*:5557` | Actors publish here (proxy receives) |
+| `PROXY_PUB_BIND` | `tcp://*:5556` | Actors subscribe here (proxy fans out) |
+| `PROXY_ID` | `proxy` | Identity used in heartbeat emission |
+| `PROXY_HEARTBEAT_MS` | `5000` | Heartbeat interval ms. `0` to disable |

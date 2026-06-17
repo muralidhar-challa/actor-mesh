@@ -40,8 +40,9 @@ stateDiagram-v2
   [*]        --> Receiving   : open LMDB, connect NNG
   Receiving  --> Receiving   : heartbeat timer fires
   Receiving  --> TTLCheck    : tuple arrives
-  TTLCheck   --> Receiving   : expired — drop
+  TTLCheck   --> Rejected    : expired — publish tuple_rejected
   TTLCheck   --> Inbox       : valid
+  Rejected   --> Receiving   : sender notified
   Inbox      --> Forking     : write to LMDB inbox
   Forking    --> Piping      : fork + exec ACTOR_HANDLER, set env vars
   Piping     --> Waiting     : write payload to stdin
@@ -52,6 +53,29 @@ stateDiagram-v2
 ```
 
 The runtime is generic and permanent. The handler is specific and ephemeral. Neither knows the other exists beyond a file path and two file descriptors.
+
+## Rejection
+
+No tuple is ever dropped silently. Any drop condition publishes a `tuple_rejected` tuple back on the bus so the original sender can observe and respond.
+
+```json
+{
+  "tuple_id":        "<uuidv7-hex>",
+  "correlation_id":  "<uuidv7-hex>",
+  "origin":          "actor-id-who-sent",
+  "topic":           "original_topic",
+  "reason":          "ttl_expired | payload_cap_exceeded | result_cap_exceeded | max_retries_exceeded"
+}
+```
+
+| Reason | Condition |
+|---|---|
+| `ttl_expired` | Tuple arrived after its TTL window |
+| `payload_cap_exceeded` | Incoming payload exceeds `ACTOR_MAX_PAYLOAD` |
+| `result_cap_exceeded` | Handler result exceeds `ACTOR_MAX_PAYLOAD` |
+| `max_retries_exceeded` | Handler returned non-zero after all retry attempts |
+
+Subscribe to `tuple_rejected` to implement dead-letter handling, surface errors to users, or feed observability pipelines.
 
 ## Deployment
 
