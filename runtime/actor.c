@@ -440,6 +440,33 @@ static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
     lmdb_del(dbi_outbox, out_hdr.id, 16);
 }
 
+/* ── Rejection ───────────────────────────────────────────────────────────── */
+
+static void publish_rejection(const actor_header_t* in_hdr, const char* reason) {
+    char   id_hex[33], corr_hex[33];
+    actor_uuid_hex(in_hdr->id,             id_hex);
+    actor_uuid_hex(in_hdr->correlation_id, corr_hex);
+
+    char payload[512];
+    size_t plen = (size_t)snprintf(payload, sizeof(payload),
+        "{\"tuple_id\":\"%s\",\"correlation_id\":\"%s\","
+        "\"origin\":\"%s\",\"topic\":\"%s\",\"reason\":\"%s\"}",
+        id_hex, corr_hex,
+        in_hdr->origin, in_hdr->topic, reason);
+
+    actor_header_t hdr;
+    actor_tuple_init(&hdr, "tuple_rejected", cfg.id,
+                     in_hdr->correlation_id, in_hdr->id, (uint32_t)plen);
+    actor_uuid_gen(hdr.id);
+
+    size_t frame_len = sizeof(actor_header_t) + plen;
+    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
+    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, g_frame_buf, frame_len, 0);
+
+    fprintf(stderr, "[actor] rejected tuple %s reason=%s\n", id_hex, reason);
+}
+
 /* ── Heartbeat ───────────────────────────────────────────────────────────── */
 
 static void emit_heartbeat(void) {
@@ -467,10 +494,9 @@ static void emit_heartbeat(void) {
 static void process_tuple(const actor_header_t* hdr,
                           const uint8_t*        payload,
                           size_t                payload_len) {
-    /* hard cap on incoming payload — drop silently if exceeded */
+    /* hard cap on incoming payload */
     if (payload_len > ACTOR_MAX_PAYLOAD) {
-        fprintf(stderr, "[actor] incoming payload %zu exceeds cap %d, dropping\n",
-                payload_len, ACTOR_MAX_PAYLOAD);
+        publish_rejection(hdr, "payload_cap_exceeded");
         return;
     }
 
@@ -495,14 +521,14 @@ static void process_tuple(const actor_header_t* hdr,
         }
 
         if (result_len == -2) {
-            /* payload cap exceeded — no point retrying */
+            /* result payload cap exceeded — no point retrying */
+            publish_rejection(hdr, "result_cap_exceeded");
             break;
         }
 
         attempt++;
         if (attempt > cfg.retry_max) {
-            fprintf(stderr, "[actor] handler failed after %d attempts, dropping\n",
-                    cfg.retry_max);
+            publish_rejection(hdr, "max_retries_exceeded");
             break;
         }
 
@@ -572,7 +598,7 @@ int actor_run(void) {
 
         /* TTL check */
         if (actor_tuple_expired(hdr)) {
-            fprintf(stderr, "[actor] tuple expired, dropping (topic=%.32s)\n", hdr->topic);
+            publish_rejection(hdr, "ttl_expired");
             nng_msg_free(msg);
             continue;
         }
