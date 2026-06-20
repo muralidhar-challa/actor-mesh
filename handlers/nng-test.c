@@ -6,6 +6,7 @@
  * the echo result on <sub_url>.
  */
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE  /* usleep on musl */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,10 @@ int main(int argc, char **argv) {
     const char *pub_url = argv[1];
     const char *sub_url = argv[2];
     const char *topic   = argc > 3 ? argv[3] : "test.echo";
-    const char *result_topic = "test.echo.result";
+    char result_topic[64];
+    snprintf(result_topic, sizeof(result_topic), "%s.result", topic);
+    const char *payload_str = argc > 4 ? argv[4]
+        : "{\"action\":\"create\",\"phase_id\":\"test-phase\",\"task\":{\"title\":\"Mesh-Test\",\"status\":\"todo\"}}";
 
     /* Build a proper actor_header_t + payload */
     unsigned char frame[2048];
@@ -63,11 +67,10 @@ int main(int argc, char **argv) {
     memcpy(frame + 112, &now, 8);
 
     /* payload_len */
-    const char *payload = "{\"test\":\"hello-mesh\"}";
-    uint32_t plen = (uint32_t)strlen(payload);
+    uint32_t plen = (uint32_t)strlen(payload_str);
     memcpy(frame + 136, &plen, 4);
 
-    memcpy(frame + 256, payload, plen);
+    memcpy(frame + 256, payload_str, plen);
     size_t total = 256 + plen;
 
     fprintf(stderr, "[nng-test] sending %zu bytes on topic '%s' to %s\n",

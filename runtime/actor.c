@@ -125,19 +125,28 @@ static int nng_setup(void) {
         fprintf(stderr, "[actor] nng_pub0_open: %s\n", nng_strerror(rc));
         return -1;
     }
-    if ((rc = nng_dial(nng_pub, cfg.bus_pub, NULL, 0)) != 0) {
-        fprintf(stderr, "[actor] pub dial %s: %s\n", cfg.bus_pub, nng_strerror(rc));
-        return -1;
+    /* retry dial — proxy may not be listening yet */
+    for (int i = 0; i < 30; i++) {
+        rc = nng_dial(nng_pub, cfg.bus_pub, NULL, 0);
+        if (rc == 0) break;
+        fprintf(stderr, "[actor] pub dial %s: %s (retry %d)\n",
+                cfg.bus_pub, nng_strerror(rc), i);
+        sleep(1);
     }
+    if (rc != 0) return -1;
 
     if ((rc = nng_sub0_open(&nng_sub)) != 0) {
         fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
         return -1;
     }
-    if ((rc = nng_dial(nng_sub, cfg.bus_sub, NULL, 0)) != 0) {
-        fprintf(stderr, "[actor] sub dial %s: %s\n", cfg.bus_sub, nng_strerror(rc));
-        return -1;
+    for (int i = 0; i < 30; i++) {
+        rc = nng_dial(nng_sub, cfg.bus_sub, NULL, 0);
+        if (rc == 0) break;
+        fprintf(stderr, "[actor] sub dial %s: %s (retry %d)\n",
+                cfg.bus_sub, nng_strerror(rc), i);
+        sleep(1);
     }
+    if (rc != 0) return -1;
 
     /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result"
      * NNG sub0 does prefix matching on the message body. The topic field
