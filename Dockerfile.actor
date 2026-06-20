@@ -1,12 +1,44 @@
-FROM ubuntu:24.04
+FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libnng-dev liblmdb-dev && \
+    gcc libc6-dev libnng-dev liblmdb-dev binutils && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Actor runtime ──────────────────────────────────────────────────
 COPY runtime/ /src/runtime/
 WORKDIR /src
-RUN gcc -Wall -Wextra -O2 -std=c11 \
+RUN gcc -Wall -Wextra -Os -std=c11 \
     runtime/main.c runtime/actor.c \
     -lnng -llmdb -o /actor && \
     strip /actor
+
+# ── Echo handler (test) ────────────────────────────────────────────
+COPY handlers/echo.c /src/handlers/
+COPY handlers/nng-test.c /src/handlers/
+RUN mkdir -p /handlers && \
+    gcc -Wall -Wextra -Os -std=c11 \
+    handlers/echo.c -o /handlers/echo && \
+    strip /handlers/echo && \
+    gcc -Wall -Wextra -Os -std=c11 \
+    handlers/nng-test.c -lnng -o /handlers/nng-test && \
+    strip /handlers/nng-test
+
+# ── Package for scratch ────────────────────────────────────────────
+RUN mkdir -p /out/bin /out/handlers /out/lib && \
+    cp /actor /out/ && \
+    cp /handlers/echo /out/handlers/ && \
+    cp /handlers/nng-test /out/handlers/ && \
+    cp -L /bin/sh /out/bin/sh && \
+    cp /lib/aarch64-linux-gnu/libc.so.6 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/libnng.so.1 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/liblmdb.so.0 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/libpthread.so.0 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/libmbedtls.so.14 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/libmbedx509.so.1 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/libmbedcrypto.so.7 /out/lib/ && \
+    cp /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /out/lib/ && \
+    echo "=== packaged ===" && ls -laR /out/
+
+FROM scratch
+COPY --from=builder /out /
 EXPOSE 5556 5557
 ENTRYPOINT ["/actor"]
