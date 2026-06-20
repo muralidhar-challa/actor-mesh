@@ -24,5 +24,6 @@ COPY --from=builder /actor /actor
 COPY --from=builder /handlers/echo /handlers/echo
 COPY --from=builder /handlers/nng-test /handlers/nng-test
 COPY handlers/task-worker /handlers/task-worker
+COPY handlers/project-admin /handlers/project-admin
 EXPOSE 5556 5557
 ENTRYPOINT ["/actor"]
