@@ -43,6 +43,33 @@ static void emit_heartbeat(const char* id) {
     nng_send(g_pub, frame, sizeof(actor_header_t) + plen, 0);
 }
 
+/* listen_all --- nng_listen on each comma-separated URL in urls */
+static int listen_all(nng_socket sock, const char *urls) {
+    char buf[256];
+    const char *start = urls;
+    const char *p;
+    for (p = urls; ; p++) {
+        if (*p == ',' || *p == '\0') {
+            size_t len = (size_t)(p - start);
+            while (len > 0 && start[len-1] == ' ') len--; /* trim trailing space */
+            if (len >= sizeof(buf)) len = sizeof(buf)-1;
+            memcpy(buf, start, len);
+            buf[len] = '\0';
+            int rc = nng_listen(sock, buf, NULL, 0);
+            if (rc != 0) {
+                fprintf(stderr, "[proxy] listen %s: %s\n", buf, nng_strerror(rc));
+                if (*p == '\0') return rc; /* fail on last URL */
+            } else {
+                fprintf(stderr, "[proxy] listen %s: ok\n", buf);
+            }
+            if (*p == '\0') return 0;
+            start = p + 1;
+            while (*start == ' ') start++;
+            p = start - 1;
+        }
+    }
+}
+
 int main(void) {
     const char* sub_bind     = getenv("PROXY_SUB_BIND");
     const char* pub_bind     = getenv("PROXY_PUB_BIND");
@@ -70,8 +97,7 @@ int main(void) {
         return 1;
     }
 
-    if ((rc = nng_listen(sub, sub_bind, NULL, 0)) != 0) {
-        fprintf(stderr, "[proxy] sub listen %s: %s\n", sub_bind, nng_strerror(rc));
+    if ((rc = listen_all(sub, sub_bind)) != 0) {
         nng_close(g_pub);
         nng_close(sub);
         return 1;
@@ -79,8 +105,7 @@ int main(void) {
     /* Subscribe to all topics */
     nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
 
-    if ((rc = nng_listen(g_pub, pub_bind, NULL, 0)) != 0) {
-        fprintf(stderr, "[proxy] pub listen %s: %s\n", pub_bind, nng_strerror(rc));
+    if ((rc = listen_all(g_pub, pub_bind)) != 0) {
         nng_close(g_pub);
         nng_close(sub);
         return 1;

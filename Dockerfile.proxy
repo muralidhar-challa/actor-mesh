@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libnng-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY proxy/proxy.c /src/
+COPY runtime/actor_tuple.h /src/
+COPY runtime/actor_uuid.h /src/
+WORKDIR /src
+RUN gcc -Wall -Wextra -O2 -std=c11 proxy.c -lnng -o /mesh-proxy
+RUN strip /mesh-proxy
+EXPOSE 5556 5557 8080 8081
+ENTRYPOINT ["/mesh-proxy"]
