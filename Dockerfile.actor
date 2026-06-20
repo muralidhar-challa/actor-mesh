@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libnng-dev liblmdb-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY runtime/ /src/runtime/
+WORKDIR /src
+RUN gcc -Wall -Wextra -O2 -std=c11 \
+    runtime/main.c runtime/actor.c \
+    -lnng -llmdb -o /actor && \
+    strip /actor
+EXPOSE 5556 5557
+ENTRYPOINT ["/actor"]
