@@ -114,25 +114,19 @@ static void http_handle(int fd) {
     nng_socket_set(rsub, NNG_OPT_SUB_SUBSCRIBE, result_topic, strlen(result_topic)+1);
     nng_socket_set_ms(rsub, NNG_OPT_RECVTIMEO, 5000);
 
-    /* Fork nngcat to publish (guarantees separate process) */
-    int rc2 = 0;
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child: run nngcat, feed data via stdin */
-        int p[2]; pipe(p);
-        pid_t c2 = fork();
-        if (c2 == 0) {
-            close(p[1]); dup2(p[0], STDIN_FILENO); close(p[0]);
-            execlp("nngcat", "nngcat", "--pub", "--dial",
-                   "tcp://127.0.0.1:5557", "--data", "-", NULL);
-            _exit(1);
+    /* Publish via inproc transport to g_pub */
+    nng_socket ipub;
+    int rc2 = nng_pub0_open(&ipub);
+    fprintf(stderr, "[proxy] http: pub open=%d\n", rc2);
+    if (rc2 == 0) {
+        rc2 = nng_dial(ipub, "inproc://http-relay", NULL, 0);
+        fprintf(stderr, "[proxy] http: inproc dial=%d\n", rc2);
+        if (rc2 == 0) {
+            rc2 = nng_send(ipub, body, body_len, 0);
+            fprintf(stderr, "[proxy] http: send %zu bytes = %d\n", body_len, rc2);
         }
-        close(p[0]); write(p[1], body, body_len); close(p[1]);
-        waitpid(c2, NULL, 0);
-        _exit(0);
-    } else if (pid > 0) {
-        waitpid(pid, NULL, 0);
-    } else { rc2 = -1; }
+        nng_close(ipub);
+    }
     if (rc2 != 0) {
         dprintf(fd, "HTTP/1.0 200\r\nContent-Type: application/json\r\n\r\n"
                 "{\"ok\":false,\"error\":\"pub fail\"}");
@@ -182,6 +176,8 @@ int main(void) {
     listen_all(sub, sub_bind);
     nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
     listen_all(g_pub, pub_bind);
+    /* Additional inproc listener on g_pub for HTTP handler relay */
+    nng_listen(g_pub, "inproc://http-relay", NULL, 0);
     nng_socket_set_ms(sub, NNG_OPT_RECVTIMEO, 100);
 
     /* HTTP listener */
