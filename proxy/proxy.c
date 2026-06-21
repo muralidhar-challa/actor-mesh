@@ -16,6 +16,13 @@
 #include <signal.h>
 #include <time.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <poll.h>
+
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
 #include <nng/protocol/pubsub0/sub.h>
@@ -27,6 +34,34 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
 static nng_socket g_pub;
+
+/* ── Minimal SHA1 (RFC 3174) ──────────────────────────────────── */
+typedef struct { uint32_t s[5]; uint64_t n; uint8_t b[64]; int bi; } sha1_t;
+
+static inline uint32_t sha1_rol(uint32_t v, int n) { return (v<<n)|(v>>(32-n)); }
+
+static void sha1_blk(uint32_t s[5], const uint8_t blk[64]) {
+    uint32_t w[80], a=s[0], b=s[1], c=s[2], d=s[3], e=s[4], t, k;
+    int i;
+    for (i=0;i<16;i++) w[i]=((uint32_t)blk[i*4]<<24)|((uint32_t)blk[i*4+1]<<16)|((uint32_t)blk[i*4+2]<<8)|blk[i*4+3];
+    for (i=16;i<80;i++) w[i]=sha1_rol(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
+    for (i=0;i<80;i++) {
+        if(i<20)      {k=0x5A827999;t=(b&c)|((~b)&d);}
+        else if(i<40) {k=0x6ED9EBA1;t=b^c^d;}
+        else if(i<60) {k=0x8F1BBCDC;t=(b&c)|(b&d)|(c&d);}
+        else          {k=0xCA62C1D6;t=b^c^d;}
+        t+=sha1_rol(a,5)+e+k+w[i]; e=d; d=c; c=sha1_rol(b,30); b=a; a=t;
+    }
+    s[0]+=a; s[1]+=b; s[2]+=c; s[3]+=d; s[4]+=e;
+}
+
+static void sha1_init(sha1_t *x) {
+    x->s[0]=0x67452301; x->s[1]=0xEFCDAB89; x->s[2]=0x98BADCFE;
+    x->s[3]=0x10325476; x->s[4]=0xC3D2E1F0; x->n=0; x->bi=0;
+}
+
+static void sha1_upd(sha1_t *x, const void *p, size_t l) {
+    const uint8_t *d=(const uint8_t*)p;
 
 static void emit_heartbeat(const char* id) {
     char payload[128];
@@ -82,9 +117,14 @@ int main(void) {
     listen_all(sub, sub_bind);
     nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
     listen_all(g_pub, pub_bind);
+    /* WebSocket for browser actors */
+    rc = nng_listen(sub, "ws://0.0.0.0:8080", NULL, 0);
+    fprintf(stderr, "[proxy] ws-sub %s\n", rc == 0 ? "ok" : nng_strerror(rc));
+    rc = nng_listen(g_pub, "ws://0.0.0.0:8081", NULL, 0);
+    fprintf(stderr, "[proxy] ws-pub %s\n", rc == 0 ? "ok" : nng_strerror(rc));
     nng_socket_set_ms(sub, NNG_OPT_RECVTIMEO, 100);
 
-    fprintf(stderr, "[proxy] id=%s sub=%s pub=%s hb=%d\n",
+    fprintf(stderr, "[proxy] id=%s sub=%s+ws:8080 pub=%s+ws:8081 hb=%d\n",
             proxy_id, sub_bind, pub_bind, hb_ms);
 
     int64_t last_hb = 0;
