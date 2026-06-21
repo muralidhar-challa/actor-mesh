@@ -82,14 +82,9 @@ int main(void) {
     listen_all(sub, sub_bind);
     nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
     listen_all(g_pub, pub_bind);
-    /* WebSocket listeners for browser actors (same NNG SP protocol) */
-    rc = nng_listen(sub, "ws://0.0.0.0:8080", NULL, 0);
-    fprintf(stderr, "[proxy] listen ws://0.0.0.0:8080: %s\n", rc == 0 ? "ok" : nng_strerror(rc));
-    rc = nng_listen(g_pub, "ws://0.0.0.0:8081", NULL, 0);
-    fprintf(stderr, "[proxy] listen ws://0.0.0.0:8081: %s\n", rc == 0 ? "ok" : nng_strerror(rc));
     nng_socket_set_ms(sub, NNG_OPT_RECVTIMEO, 100);
 
-    fprintf(stderr, "[proxy] id=%s sub=%s+ws://8080 pub=%s+ws://8081 hb=%d\n",
+    fprintf(stderr, "[proxy] id=%s sub=%s pub=%s hb=%d\n",
             proxy_id, sub_bind, pub_bind, hb_ms);
 
     int64_t last_hb = 0;
