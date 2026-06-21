@@ -71,7 +71,8 @@ int main(void) {
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 
-    nng_socket sub; int rc;
+    nng_socket sub, raw_sub;
+    int rc, have_raw = 0;
 
     if ((rc = nng_sub0_open(&sub)) != 0) {
         fprintf(stderr, "[proxy] sub open: %s\n", nng_strerror(rc)); return 1;
@@ -82,6 +83,15 @@ int main(void) {
     listen_all(sub, sub_bind);
     nng_socket_set(sub, NNG_OPT_SUB_SUBSCRIBE, "", 0);
     listen_all(g_pub, pub_bind);
+
+    /* Raw SUB for browser traffic — no SP framing, just bytes */
+    if ((rc = nng_sub0_open_raw(&raw_sub)) == 0) {
+        if ((rc = nng_listen(raw_sub, "tcp://0.0.0.0:5558", NULL, 0)) == 0) {
+            have_raw = 1;
+            nng_socket_set_ms(raw_sub, NNG_OPT_RECVTIMEO, 0);
+            fprintf(stderr, "[proxy] raw sub on tcp://0.0.0.0:5558 ok\n");
+        }
+    }
     nng_socket_set_ms(sub, NNG_OPT_RECVTIMEO, 100);
 
     fprintf(stderr, "[proxy] id=%s sub=%s pub=%s hb=%d\n",
@@ -94,6 +104,19 @@ int main(void) {
             int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
             if (now_ms - last_hb >= hb_ms) { emit_heartbeat(proxy_id); last_hb = now_ms; }
         }
+        /* Raw sub — browser traffic, no SP framing */
+        if (have_raw) {
+            nng_msg* rmsg = NULL;
+            rc = nng_recvmsg(raw_sub, &rmsg, 0);
+            if (rc == 0) {
+                size_t rlen = nng_msg_len(rmsg);
+                fprintf(stderr, "[proxy] raw recv %zu bytes\n", rlen);
+                nng_sendmsg(g_pub, rmsg, 0);
+                nng_msg_free(rmsg);
+            }
+        }
+
+        /* Sub → pub relay */
         nng_msg* msg = NULL;
         rc = nng_recvmsg(sub, &msg, 0);
         if (rc == NNG_ETIMEDOUT) continue;
@@ -104,6 +127,7 @@ int main(void) {
     }
 
     fprintf(stderr, "[proxy] shutting down\n");
+    if (have_raw) nng_close(raw_sub);
     nng_close(g_pub); nng_close(sub);
     return 0;
 }
