@@ -12,6 +12,8 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/wait.h>
@@ -126,6 +128,7 @@ int main(void) {
     struct sockaddr_in6 addr = { .sin6_family = AF_INET6, .sin6_port = htons(8082), .sin6_addr = in6addr_any };
     if (bind(http_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
         listen(http_fd, 8);
+        fcntl(http_fd, F_SETFL, O_NONBLOCK); /* accept() must not block the mesh forwarding loop */
         fprintf(stderr, "[proxy] http on :8082\n");
     } else { close(http_fd); http_fd = -1; }
 
@@ -138,7 +141,7 @@ int main(void) {
             int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
             if (now_ms - last_hb >= hb_ms) { emit_heartbeat(proxy_id); last_hb = now_ms; }
         }
-        /* Accept HTTP connections (synchronous — blocks loop for ~5s, fine for dev) */
+        /* Accept HTTP connections (non-blocking — falls through to mesh forwarding below) */
         if (http_fd >= 0) {
             int cfd = accept(http_fd, NULL, NULL);
             if (cfd >= 0) {
