@@ -23,7 +23,7 @@ RUN apk add --no-cache nng lmdb
 COPY --from=builder /actor /actor
 COPY --from=builder /handlers/echo /handlers/echo
 COPY --from=builder /handlers/nng-test /handlers/nng-test
-COPY handlers/project-worker /handlers/project-worker
+COPY handlers/generic-worker /handlers/generic-worker
 COPY handlers/project-admin /handlers/project-admin
 COPY handlers/user-session /handlers/user-session
 EXPOSE 5556 5557
