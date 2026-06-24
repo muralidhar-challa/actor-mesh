@@ -18,21 +18,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  _reserved[120];
 } actor_header_t;
 
-// Emit a placeholder UUID (caller should overwrite with crypto.getRandomValues in JS)
-static void uuid4(uint8_t *out) {
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(i * 7 + 13);
-}
-
 // buildFrame: topic (string ptr), topicLen, origin (string ptr), originLen,
+//             id (16 raw bytes, caller-generated via crypto.getRandomValues),
 //             payload (string ptr), payloadLen, output buffer (256+payloadLen bytes)
 // Returns: total frame length
 int buildFrame(char *topic, int topicLen, char *origin, int originLen,
-               char *payload, int payloadLen, uint8_t *output) {
+               uint8_t *id, char *payload, int payloadLen, uint8_t *output) {
     actor_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
 
     memcpy(hdr.topic, topic, topicLen < 32 ? topicLen : 31);
-    uuid4(hdr.id);
+    memcpy(hdr.id, id, 16);
     memcpy(hdr.origin, origin, originLen < 32 ? originLen : 31);
     hdr.payload_len = (uint32_t)payloadLen;
 
@@ -58,4 +54,18 @@ int parsePayload(uint8_t *frame, int frameLen, uint8_t *payloadOut) {
     if (plen > (uint32_t)(frameLen - 256)) plen = (uint32_t)(frameLen - 256);
     memcpy(payloadOut, frame + 256, plen);
     return (int)plen;
+}
+
+// parseId: read this frame's own 16-byte id (output buffer >= 16 bytes)
+void parseId(uint8_t *frame, int frameLen, uint8_t *idOut) {
+    if (frameLen < 256) { memset(idOut, 0, 16); return; }
+    memcpy(idOut, frame + 32, 16); /* offsetof(actor_header_t, id) */
+}
+
+// parseCausationId: read the id of the request this frame is a reply to
+// (output buffer >= 16 bytes) -- used to correlate a worker's result frame
+// back to the request frame that caused it.
+void parseCausationId(uint8_t *frame, int frameLen, uint8_t *idOut) {
+    if (frameLen < 256) { memset(idOut, 0, 16); return; }
+    memcpy(idOut, frame + 64, 16); /* offsetof(actor_header_t, causation_id) */
 }
