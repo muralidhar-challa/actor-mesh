@@ -24,4 +24,5 @@ examples/employee-mesh/handlers/tools/pii-filter
 handlers/project-admin
 handlers/project-worker
 handlers/user-session
-wasm/*
+wasm/*.wasm
+wasm/*.js
