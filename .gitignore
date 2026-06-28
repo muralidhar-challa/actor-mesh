@@ -1,0 +1,18 @@
+# Fossil migration artifacts
+.fslckout
+.fossil-settings/
+*.fossil
+
+# Build artifacts
+bin/
+
+# LMDB databases
+*.mdb
+*.mdb-lock
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
