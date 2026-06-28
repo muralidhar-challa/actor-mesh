@@ -2,15 +2,11 @@
 #
 # ── Quick start ────────────────────────────────────────────────────────────
 #   make                build handlers
-#   make ui             build clay SDL2 desktop UI
-#   make run-ui         start proxy + actors + desktop UI (full PII pipeline)
+#   make run            start proxy + actors (full PII pipeline)
 #   make stop           kill everything
 #
 # ── LLM key ────────────────────────────────────────────────────────────────
-#   export LLM_API_KEY=sk-... && make run-ui
-#
-# ── Clay SDL2 renderer ─────────────────────────────────────────────────────
-#   git clone --depth=1 https://github.com/nicbarker/clay /tmp/clay
+#   export LLM_API_KEY=sk-... && make run
 
 ROOT    = ../..
 RUNTIME = $(ROOT)/runtime
@@ -34,12 +30,9 @@ PROXY      = $(ROOT)/bin/mesh-proxy
 
 # ── Build ──────────────────────────────────────────────────────────────────
 
-.PHONY: all handlers ui client tui clean
+.PHONY: all handlers client tui clean
 
 all: handlers
-
-
-
 
 handlers/agents/llm-agent: handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON)
 	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
@@ -54,23 +47,8 @@ client: client.c $(MPACK_SRCS)
 tui: tui.c $(MPACK_SRCS)
 	$(CC) $(CFLAGS) tui.c $(MPACK_SRCS) $(LIBS) -lpthread -lncursesw -o $@
 
-UI_SRCS = ui/main.c ui/state.c ui/net.c \
-          ui/components/header.c \
-          ui/components/actors.c \
-          ui/components/bus.c \
-          ui/components/publish.c
-
-ui/clay-ui: $(UI_SRCS)
-	$(CC) -Wall -O2 -std=c11 \
-		-Wno-unused-variable -Wno-format-truncation -Wno-parentheses \
-		$(UI_SRCS) \
-		$(shell sdl2-config --cflags --libs) -lSDL2_ttf -lnng \
-		-o ui/clay-ui
-
-ui: ui/clay-ui
-
 clean:
-	rm -f ui/clay-ui
+	@echo "[clean] nothing to do"
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -90,17 +68,16 @@ COMMON_ENV = ACTOR_BUS_SUB=$(BUS_SUB) ACTOR_BUS_PUB=$(BUS_PUB) ACTOR_HEARTBEAT_M
 
 # ── Run (full PII pipeline) ────────────────────────────────────────────────
 
-.PHONY: stop run-ui
+.PHONY: stop run
 
 stop:
 	@fuser -k 5557/tcp 5556/tcp 2>/dev/null; true
 	@pkill -9 mesh-proxy 2>/dev/null; true
 	@pkill -9 actor 2>/dev/null; true
-	@pkill -9 clay-ui 2>/dev/null; true
 	@rm -rf $(LMDB_BASE) /tmp/mcp-test 2>/dev/null; true
 	@echo "[mesh] stopped — ports freed, LMDB wiped"
 
-run-ui: stop
+run: stop
 	@# proxy
 	@mkdir -p $(LMDB_BASE) $(LOGDIR) $(TOKENMAP_PATH)
 	@PROXY_SUB_BIND=tcp://127.0.0.1:5557 PROXY_PUB_BIND=tcp://127.0.0.1:5556 $(PROXY) >>$(LOGDIR)/proxy.log 2>&1 &
@@ -149,4 +126,5 @@ run-ui: stop
 
 	@echo "[mesh] proxy + 5 actors running (PII pipeline active)"
 	@echo ""
-	@cd ui && $(COMMON_ENV) ./clay-ui
+	@echo "[mesh] use test-mcp-mesh.sh or ./client to interact"
+	@wait
