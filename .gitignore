@@ -6,6 +6,12 @@
 # Build artifacts
 bin/
 
+# Handler binaries -- extracted from their own images before building
+# Dockerfile.actor, not source, regenerated per build
+handlers/generic-worker
+handlers/project-admin
+handlers/user-session
+
 # LMDB databases
 *.mdb
 *.mdb-lock
