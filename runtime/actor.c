@@ -554,6 +554,41 @@ static void process_tuple(const actor_header_t* hdr,
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
 
+/* Reap orphaned descendants.
+ *
+ * platform_spawn already waits for the shell it forks, so its own child never
+ * lingers. The leak is one generation further down: the handler's shell
+ * spawns its own children, and any that outlive it are reparented to this
+ * process. In a container that is PID 1, whose kernel-assigned duty is to
+ * reap them -- and nothing here did, so they accumulated as zombies for the
+ * lifetime of the pod. Observed live: 21 of them (gpg, gpgconf, sh) aged up
+ * to four hours, in a container whose only live process was this one.
+ *
+ * Zombies hold a PID table slot each. Left long enough the cgroup's pids.max
+ * is reached, and the next fork in ANY process in that container fails with
+ * EAGAIN -- which surfaces as an unrelated handler dying for no visible
+ * reason, far from the cause.
+ *
+ * Deliberately a sweep here rather than a SIGCHLD handler or SIG_IGN. Both of
+ * those reap indiscriminately and would race platform_spawn's blocking
+ * waitpid for its own child: the handler's exit status is what decides
+ * success or retry, and losing it to ECHILD would silently turn every failed
+ * run into a successful one. This runs between messages, where no tracked
+ * waitpid is outstanding, so it can only ever collect genuine orphans.
+ *
+ * WNOHANG keeps it non-blocking: with nothing to reap it is one syscall, and
+ * the loop below already wakes ~10x/sec on the receive timeout.
+ */
+#ifndef _WIN32
+static void reap_orphans(void) {
+    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+}
+#else
+/* Windows has no fork/orphan model to clean up after; handler processes are
+   waited for explicitly in the _WIN32 branch of platform_spawn. */
+static void reap_orphans(void) { }
+#endif
+
 int actor_run(void) {
     if (cfg_load() < 0) return -1;
 
@@ -569,6 +604,11 @@ int actor_run(void) {
     int64_t last_hb = 0;
 
     while (!g_stop) {
+        /* Collect any descendants orphaned by the previous handler run. Safe
+           here and only here: platform_spawn's waitpid has already returned,
+           so nothing this process still needs a status for is outstanding. */
+        reap_orphans();
+
         /* heartbeat */
         if (cfg.heartbeat_ms > 0) {
             struct timespec ts;
