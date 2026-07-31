@@ -38,7 +38,7 @@ ifneq ($(TARGET),native)
   CFLAGS  += -target $(TARGET)
 endif
 
-.PHONY: all actor mesh-proxy clean linux-arm64 macos-x64 macos-arm64 windows-x64
+.PHONY: all actor mesh-proxy clean test-concurrency linux-arm64 macos-x64 macos-arm64 windows-x64
 
 all: actor mesh-proxy
 
@@ -51,6 +51,12 @@ actor: runtime/main.c runtime/actor.c runtime/actor.h \
 
 mesh-proxy: proxy/proxy.c | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o bin/mesh-proxy
+
+# Concurrency / child-reaping tests. Needs actor + mesh-proxy built first;
+# run from the repo root so ./bin/... resolves.
+test-concurrency: actor mesh-proxy tests/test-concurrency.c | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-concurrency.c -lnng -o bin/test-concurrency
+	./bin/test-concurrency
 
 clean:
 	rm -rf bin/

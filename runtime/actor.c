@@ -24,6 +24,10 @@
 #include <time.h>
 #include <sys/wait.h>
 
+#ifndef _WIN32
+#  include <pthread.h>
+#endif
+
 #ifdef _WIN32
 #  include <windows.h>
 #endif
@@ -45,13 +49,40 @@
 
 #define ACTOR_MAX_FRAME (ACTOR_MAX_PAYLOAD + sizeof(actor_header_t))
 
+/* ── Concurrency ─────────────────────────────────────────────────────────── */
+
+/* ACTOR_CONCURRENCY (env) — how many messages may be in flight at once.
+ * 1 (the default) is exactly the historical behaviour: one thread, one
+ * message, one handler. Above 1, that many worker threads each run the same
+ * receive→handle→publish cycle.
+ *
+ * Raising this is worth it because the per-message cost is dominated by
+ * fork/exec of the handler binary (~100MB statically linked, ~200ms), which is
+ * mostly waiting rather than CPU. It is capped because each worker costs a
+ * thread plus its own ACTOR_MAX_PAYLOAD-sized buffers. */
+#define ACTOR_MAX_CONCURRENCY 32
+
+/* Thread-local storage. Windows keeps a single worker (see cfg_load), so the
+ * portable spelling is only needed on the POSIX path. */
+#ifdef _WIN32
+#  define ACTOR_TLS
+#else
+#  define ACTOR_TLS __thread
+#endif
+
 /* ── Static buffers — zero heap ──────────────────────────────────────────── */
 
+/* Thread-local, not merely static: with ACTOR_CONCURRENCY > 1 several worker
+ * threads run a message each, and a shared buffer would have one thread's
+ * handler output overwritten by another's mid-publish. Still no heap — each
+ * thread gets its own fixed allocation, so the cap is per worker rather than
+ * per process. */
+
 /* g_result_buf: handler stdout is read into here — fixed, never grows */
-static uint8_t g_result_buf[ACTOR_MAX_PAYLOAD];
+static ACTOR_TLS uint8_t g_result_buf[ACTOR_MAX_PAYLOAD];
 
 /* g_frame_buf: header + payload assembled here for LMDB writes and NNG sends */
-static uint8_t g_frame_buf[ACTOR_MAX_FRAME];
+static ACTOR_TLS uint8_t g_frame_buf[ACTOR_MAX_FRAME];
 
 /* ── Config ──────────────────────────────────────────────────────────────── */
 
@@ -66,6 +97,7 @@ typedef struct {
     int64_t     ttl_ns;
     int         heartbeat_ms;
     int         retry_max;
+    int         concurrency;
 } actor_cfg_t;
 
 static actor_cfg_t cfg;
@@ -97,6 +129,18 @@ static int cfg_load(void) {
 
     const char* rm = getenv("ACTOR_RETRY_MAX");
     cfg.retry_max = rm ? atoi(rm) : 3;
+
+    /* Default 1 = the historical single-message-at-a-time behaviour, so an
+       existing deployment gets exactly what it had until it opts in. */
+    const char* cc = getenv("ACTOR_CONCURRENCY");
+    cfg.concurrency = cc ? atoi(cc) : 1;
+    if (cfg.concurrency < 1) cfg.concurrency = 1;
+    if (cfg.concurrency > ACTOR_MAX_CONCURRENCY) cfg.concurrency = ACTOR_MAX_CONCURRENCY;
+#ifdef _WIN32
+    /* The Windows spawn path stamps the process environment before
+       CreateProcess, which is only safe with one worker. */
+    cfg.concurrency = 1;
+#endif
 
     return 0;
 }
@@ -224,13 +268,33 @@ static size_t lmdb_count(MDB_dbi dbi) {
 
 /* ── Handler spawn — cross-platform ──────────────────────────────────────── */
 
+/* The per-message values handed to the handler through its environment.
+ * Carried as a value rather than set on the parent before forking, because
+ * with several workers running the parent's environment is shared mutable
+ * state -- see the setenv note in the Unix platform_spawn. */
+typedef struct {
+    char id_hex[33];
+    char corr_hex[33];
+    char caus_hex[33];
+    char origin[32];
+    char attempt[12];
+} child_env_t;
+
 /* platform_spawn launches the handler, pipes payload to its stdin,
  * reads result from its stdout, returns the length or error.
  * Unix: fork/exec   Windows: CreateProcess */
 #ifdef _WIN32
 
 static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap) {
+                              uint8_t*       out, size_t out_cap,
+                              const child_env_t* env) {
+    /* Windows runs a single worker (cfg_load clamps concurrency to 1 there),
+       so mutating the process environment before CreateProcess is safe. */
+    SetEnvironmentVariableA("ACTOR_TUPLE_ID",       env->id_hex);
+    SetEnvironmentVariableA("ACTOR_CORRELATION_ID", env->corr_hex);
+    SetEnvironmentVariableA("ACTOR_CAUSATION_ID",   env->caus_hex);
+    SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   env->origin);
+    SetEnvironmentVariableA("ACTOR_ATTEMPT",        env->attempt);
     HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
     HANDLE stdout_rd = NULL, stdout_wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -296,21 +360,146 @@ fail_stdin:
 
 #else /* Unix — fork/exec */
 
+/* ── Child status dispatcher ─────────────────────────────────────────────────
+ *
+ * Exactly one thread calls waitpid, and it hands each status to whichever
+ * worker owns that pid.
+ *
+ * This replaces the old arrangement, where every spawn did its own blocking
+ * waitpid and a between-messages `waitpid(-1, WNOHANG)` sweep collected
+ * orphans. That sweep was safe only because the loop was serial: with more
+ * than one handler running it would harvest another worker's child, that
+ * worker's waitpid would fail with ECHILD leaving `status` never written, and
+ * WIFEXITED would read uninitialised memory -- silently reporting a FAILED
+ * handler run as successful, which is the one outcome this runtime must never
+ * produce. (The old code's own comment called this out as the reason not to
+ * use SIGCHLD or SIG_IGN.)
+ *
+ * Centralising the wait removes the race rather than working around it, and
+ * orphan reaping falls out for free: this process is PID 1 in its container,
+ * so it inherits orphaned grandchildren, and any reaped pid that matches no
+ * slot is simply one of those and is discarded.
+ *
+ * The registration ordering is the subtle part. A worker holds `child_mu`
+ * across fork() and the store of the new pid, so the reaper -- which must take
+ * the same mutex to dispatch -- cannot observe a not-yet-registered child.
+ * Therefore "reaped a pid with no slot" unambiguously means "orphan", never
+ * "a child whose parent has not finished registering it".
+ */
+
+typedef struct {
+    pid_t pid;      /* 0 = free slot                        */
+    int   status;   /* raw waitpid status, valid when done  */
+    int   done;     /* set by the reaper                    */
+} child_slot_t;
+
+static child_slot_t   g_children[ACTOR_MAX_CONCURRENCY];
+static pthread_mutex_t child_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  child_cv = PTHREAD_COND_INITIALIZER;
+
+/* Reaper thread: the only caller of waitpid in the process. */
+static void* reaper_main(void* arg) {
+    (void)arg;
+    while (!g_stop) {
+        int   status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) {
+            /* Nothing exited (0) or no children at all (-1/ECHILD). Sleep
+               briefly rather than spin; the handler runs for far longer than
+               this, so the added latency is not measurable. */
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 5 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        pthread_mutex_lock(&child_mu);
+        for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+            if (g_children[i].pid == pid) {
+                g_children[i].status = status;
+                g_children[i].done   = 1;
+                break;
+            }
+        }
+        /* No match: an orphaned grandchild we inherited as PID 1. Reaping it
+           was the whole job -- nothing to dispatch. */
+        pthread_cond_broadcast(&child_cv);
+        pthread_mutex_unlock(&child_mu);
+    }
+    return NULL;
+}
+
+/* Block until the reaper reports `slot`'s child, then free the slot.
+   Returns the raw waitpid status. */
+static int await_child(int slot) {
+    pthread_mutex_lock(&child_mu);
+    while (!g_children[slot].done) {
+        /* Timed wait so shutdown cannot leave a worker parked forever if the
+           reaper has already stopped. */
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 50 * 1000 * 1000;
+        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&child_cv, &child_mu, &until);
+        if (g_stop && !g_children[slot].done) {
+            /* Treat an interrupted wait as a failed run: retry/rejection is
+               the safe reading, never "succeeded". */
+            g_children[slot].pid = 0;
+            g_children[slot].done = 0;
+            pthread_mutex_unlock(&child_mu);
+            return -1;
+        }
+    }
+    int status = g_children[slot].status;
+    g_children[slot].pid  = 0;
+    g_children[slot].done = 0;
+    pthread_mutex_unlock(&child_mu);
+    return status;
+}
+
 static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap) {
+                              uint8_t*       out, size_t out_cap,
+                              const child_env_t* env) {
     int to_child[2], from_child[2];
 
     if (pipe(to_child)   < 0) return -1;
     if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return -1; }
 
+    /* Claim a slot, then fork and register the pid without releasing the
+       mutex -- see the dispatcher note above for why the two must be atomic
+       with respect to the reaper. */
+    pthread_mutex_lock(&child_mu);
+    int slot = -1;
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        if (g_children[i].pid == 0 && !g_children[i].done) { slot = i; break; }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&child_mu);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        fprintf(stderr, "[actor] no free child slot (concurrency=%d)\n", cfg.concurrency);
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
+        pthread_mutex_unlock(&child_mu);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
         return -1;
     }
 
     if (pid == 0) {
+        /* Child. setenv happens HERE, after the fork, not in the parent before
+           it: the parent may be several worker threads deep, and setenv mutates
+           process-wide state, so stamping the environment in the parent would
+           race -- one worker's tuple id could reach another worker's handler.
+           The child is single-threaded, so doing it here is race-free and each
+           handler sees exactly its own message. */
+        setenv("ACTOR_TUPLE_ID",       env->id_hex,   1);
+        setenv("ACTOR_CORRELATION_ID", env->corr_hex, 1);
+        setenv("ACTOR_CAUSATION_ID",   env->caus_hex, 1);
+        setenv("ACTOR_TUPLE_ORIGIN",   env->origin,   1);
+        setenv("ACTOR_ATTEMPT",        env->attempt,  1);
+
         dup2(to_child[0],   STDIN_FILENO);
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
@@ -319,13 +508,18 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         _exit(1);
     }
 
+    g_children[slot].pid    = pid;
+    g_children[slot].done   = 0;
+    g_children[slot].status = 0;
+    pthread_mutex_unlock(&child_mu);
+
     close(to_child[0]);
     close(from_child[1]);
 
     if (write(to_child[1], in, in_len) < 0) {
         close(to_child[1]);
         close(from_child[0]);
-        waitpid(pid, NULL, 0);
+        await_child(slot);
         return -1;
     }
     close(to_child[1]);
@@ -338,7 +532,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
             uint8_t drain[256];
             while (read(from_child[0], drain, sizeof(drain)) > 0) {}
             close(from_child[0]);
-            waitpid(pid, NULL, 0);
+            await_child(slot);
             fprintf(stderr, "[actor] result exceeded ACTOR_MAX_PAYLOAD=%d, dropping\n",
                     ACTOR_MAX_PAYLOAD);
             return -2;
@@ -346,42 +540,31 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
     }
     close(from_child[0]);
 
-    int status;
-    waitpid(pid, &status, 0);
+    int status = await_child(slot);
+    if (status == -1) return -1;                        /* interrupted */
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return -1;
+    if (!WIFEXITED(status)) return -1;                  /* signalled — not a success */
 
     return (ssize_t)len;
 }
 
 #endif /* _WIN32 */
 
-/* invoke_handler: set env vars, spawn handler, return result length */
+/* invoke_handler: collect the per-message env, spawn handler, return result
+ * length. The values travel as a value into platform_spawn, which applies them
+ * where it is safe to do so for the platform (in the forked child on Unix, on
+ * the parent before CreateProcess on Windows). */
 static ssize_t invoke_handler(const actor_header_t* hdr,
                               const uint8_t*        payload,
                               size_t                payload_len) {
-    /* Set env vars before spawn — child inherits parent's environment.
-     * On Unix (fork): child gets a copy. On Windows: child gets current env. */
-    char id_hex[33], corr_hex[33], caus_hex[33], attempt_str[12];
-    actor_uuid_hex(hdr->id,             id_hex);
-    actor_uuid_hex(hdr->correlation_id, corr_hex);
-    actor_uuid_hex(hdr->causation_id,   caus_hex);
-    snprintf(attempt_str, sizeof(attempt_str), "%d", hdr->attempt);
+    child_env_t env;
+    actor_uuid_hex(hdr->id,             env.id_hex);
+    actor_uuid_hex(hdr->correlation_id, env.corr_hex);
+    actor_uuid_hex(hdr->causation_id,   env.caus_hex);
+    snprintf(env.origin,  sizeof(env.origin),  "%.*s", 31, hdr->origin);
+    snprintf(env.attempt, sizeof(env.attempt), "%d", hdr->attempt);
 
-#ifdef _WIN32
-    SetEnvironmentVariableA("ACTOR_TUPLE_ID",       id_hex);
-    SetEnvironmentVariableA("ACTOR_CORRELATION_ID", corr_hex);
-    SetEnvironmentVariableA("ACTOR_CAUSATION_ID",   caus_hex);
-    SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   hdr->origin);
-    SetEnvironmentVariableA("ACTOR_ATTEMPT",        attempt_str);
-#else
-    setenv("ACTOR_TUPLE_ID",       id_hex,      1);
-    setenv("ACTOR_CORRELATION_ID", corr_hex,    1);
-    setenv("ACTOR_CAUSATION_ID",   caus_hex,    1);
-    setenv("ACTOR_TUPLE_ORIGIN",   hdr->origin, 1);
-    setenv("ACTOR_ATTEMPT",        attempt_str, 1);
-#endif
-
-    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD);
+    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
@@ -554,39 +737,86 @@ static void process_tuple(const actor_header_t* hdr,
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
 
-/* Reap orphaned descendants.
+/* Orphaned descendants are reaped by the dispatcher's reaper thread -- see the
+ * child status dispatcher above. This comment is kept because the problem it
+ * documents is still the reason that machinery exists.
  *
- * platform_spawn already waits for the shell it forks, so its own child never
- * lingers. The leak is one generation further down: the handler's shell
- * spawns its own children, and any that outlive it are reparented to this
- * process. In a container that is PID 1, whose kernel-assigned duty is to
- * reap them -- and nothing here did, so they accumulated as zombies for the
- * lifetime of the pod. Observed live: 21 of them (gpg, gpgconf, sh) aged up
- * to four hours, in a container whose only live process was this one.
+ * platform_spawn waits for the shell it forks, so its own child never lingers.
+ * The leak is one generation further down: the handler's shell spawns its own
+ * children, and any that outlive it are reparented to this process. In a
+ * container that is PID 1, whose kernel-assigned duty is to reap them -- and
+ * nothing here did, so they accumulated as zombies for the lifetime of the
+ * pod. Observed live: 21 of them (gpg, gpgconf, sh) aged up to four hours, in
+ * a container whose only live process was this one.
  *
  * Zombies hold a PID table slot each. Left long enough the cgroup's pids.max
  * is reached, and the next fork in ANY process in that container fails with
  * EAGAIN -- which surfaces as an unrelated handler dying for no visible
  * reason, far from the cause.
  *
- * Deliberately a sweep here rather than a SIGCHLD handler or SIG_IGN. Both of
- * those reap indiscriminately and would race platform_spawn's blocking
- * waitpid for its own child: the handler's exit status is what decides
- * success or retry, and losing it to ECHILD would silently turn every failed
- * run into a successful one. This runs between messages, where no tracked
- * waitpid is outstanding, so it can only ever collect genuine orphans.
+ * This used to be a `waitpid(-1, WNOHANG)` sweep run between messages, safe
+ * only because the loop was serial: a sweep cannot tell an orphan from another
+ * worker's child, and harvesting the latter loses the exit status that decides
+ * success or retry -- silently turning a failed run into a successful one. The
+ * reaper thread resolves both jobs at once by being the single waiter and
+ * dispatching each status to the slot that owns it; a pid matching no slot is
+ * by construction an orphan.
  *
- * WNOHANG keeps it non-blocking: with nothing to reap it is one syscall, and
- * the loop below already wakes ~10x/sec on the receive timeout.
  */
-#ifndef _WIN32
-static void reap_orphans(void) {
-    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+
+/* One turn of the receive loop, shared by every worker. Returns 0 to keep
+   going, -1 to stop. Split out of actor_run so extra workers can run the
+   identical cycle -- the only thing that must NOT be duplicated per worker is
+   the heartbeat, which stays in actor_run. */
+static int serve_once(void) {
+    nng_msg* msg = NULL;
+    int rc = nng_recvmsg(nng_sub, &msg, 0);
+    if (rc == NNG_ETIMEDOUT) return 0;
+    if (rc != 0) {
+        if (g_stop) return -1;
+        fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
+        return -1;
+    }
+
+    void*  body     = nng_msg_body(msg);
+    size_t body_len = nng_msg_len(msg);
+
+    if (body_len < sizeof(actor_header_t)) {
+        fprintf(stderr, "[actor] short message %zu bytes, dropping\n", body_len);
+        nng_msg_free(msg);
+        return 0;
+    }
+
+    const actor_header_t* hdr         = (const actor_header_t*)body;
+    const uint8_t*        payload     = (const uint8_t*)body + sizeof(actor_header_t);
+    size_t                payload_len = body_len - sizeof(actor_header_t);
+
+    /* TTL check — before process_tuple, so an abandoned request costs the
+       check and nothing else. This is what keeps a backed-up queue from
+       feeding on itself: work whose caller has already given up is dropped
+       rather than forked. */
+    if (actor_tuple_expired(hdr)) {
+        publish_rejection(hdr, "ttl_expired");
+        nng_msg_free(msg);
+        return 0;
+    }
+
+    process_tuple(hdr, payload, payload_len);
+    nng_msg_free(msg);
+    return 0;
 }
-#else
-/* Windows has no fork/orphan model to clean up after; handler processes are
-   waited for explicitly in the _WIN32 branch of platform_spawn. */
-static void reap_orphans(void) { }
+
+#ifndef _WIN32
+/* Extra worker. nng sockets are safe to use from several threads, so each
+   worker simply blocks in its own recv; the SUB socket hands each message to
+   exactly one of them. */
+static void* worker_main(void* arg) {
+    (void)arg;
+    while (!g_stop) {
+        if (serve_once() < 0) break;
+    }
+    return NULL;
+}
 #endif
 
 int actor_run(void) {
@@ -598,18 +828,37 @@ int actor_run(void) {
     if (nng_setup()  < 0) return -1;
     if (lmdb_setup() < 0) return -1;
 
-    fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d\n",
-            cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD);
+    fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d concurrency=%d\n",
+            cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD, cfg.concurrency);
 
     int64_t last_hb = 0;
 
-    while (!g_stop) {
-        /* Collect any descendants orphaned by the previous handler run. Safe
-           here and only here: platform_spawn's waitpid has already returned,
-           so nothing this process still needs a status for is outstanding. */
-        reap_orphans();
+#ifndef _WIN32
+    /* The reaper runs even at concurrency 1: it is what collects the orphaned
+       grandchildren this process inherits as PID 1, a job the old between-
+       messages sweep used to do. */
+    pthread_t reaper;
+    int reaper_started = (pthread_create(&reaper, NULL, reaper_main, NULL) == 0);
+    if (!reaper_started) {
+        fprintf(stderr, "[actor] FATAL: could not start reaper thread\n");
+        return -1;
+    }
 
-        /* heartbeat */
+    pthread_t workers[ACTOR_MAX_CONCURRENCY];
+    int nworkers = 0;
+    for (int i = 1; i < cfg.concurrency; i++) {
+        if (pthread_create(&workers[nworkers], NULL, worker_main, NULL) != 0) {
+            fprintf(stderr, "[actor] could not start worker %d, continuing with %d\n",
+                    i, nworkers + 1);
+            break;
+        }
+        nworkers++;
+    }
+#endif
+
+    while (!g_stop) {
+        /* heartbeat — this thread only, so the interval does not multiply by
+           the worker count */
         if (cfg.heartbeat_ms > 0) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -621,42 +870,15 @@ int actor_run(void) {
         }
 
         /* receive with 100ms timeout — unblocks for heartbeat check */
-        nng_msg* msg = NULL;
-        int rc = nng_recvmsg(nng_sub, &msg, 0);
-        if (rc == NNG_ETIMEDOUT) {
-            continue;
-        }
-        if (rc != 0) {
-            if (g_stop) break;
-            fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
-            break;
-        }
-
-        void*  body      = nng_msg_body(msg);
-        size_t body_len  = nng_msg_len(msg);
-
-        if (body_len < sizeof(actor_header_t)) {
-            fprintf(stderr, "[actor] short message %zu bytes, dropping\n", body_len);
-            nng_msg_free(msg);
-            continue;
-        }
-
-        const actor_header_t* hdr         = (const actor_header_t*)body;
-        const uint8_t*        payload     = (const uint8_t*)body + sizeof(actor_header_t);
-        size_t                payload_len = body_len - sizeof(actor_header_t);
-
-        /* TTL check */
-        if (actor_tuple_expired(hdr)) {
-            publish_rejection(hdr, "ttl_expired");
-            nng_msg_free(msg);
-            continue;
-        }
-
-        process_tuple(hdr, payload, payload_len);
-        nng_msg_free(msg);
+        if (serve_once() < 0) break;
     }
 
     fprintf(stderr, "[actor] shutting down\n");
+#ifndef _WIN32
+    g_stop = 1;
+    for (int i = 0; i < nworkers; i++) pthread_join(workers[i], NULL);
+    pthread_join(reaper, NULL);
+#endif
     nng_close(nng_pub);
     nng_close(nng_sub);
     mdb_env_close(mdb_env);
