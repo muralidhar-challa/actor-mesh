@@ -39,4 +39,16 @@
  */
 int actor_isolation_apply(void);
 
+/* Apply the tuple-lifetime isolation named in ACTOR_TUPLE_UNSHARE.
+ *
+ * Call in the forked child, before exec. The namespaces are created per tuple
+ * and destroyed when the handler exits -- see the comment in the .c for why
+ * the PID namespace in particular cannot be created at startup.
+ *
+ * Returns 0 if everything requested was applied (including nothing requested),
+ * -1 otherwise. The caller must _exit non-zero on -1: a tuple must never run
+ * less isolated than it was configured to be.
+ */
+int actor_isolation_tuple(void);
+
 #endif /* ACTOR_ISOLATION_H */

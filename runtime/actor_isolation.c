@@ -23,6 +23,9 @@
 #include <linux/landlock.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
 
 /* ── Environment parsing ─────────────────────────────────────────────────── */
 
@@ -156,6 +159,155 @@ static int drop_privilege(void) {
 }
 
 
+
+
+/* ── Per-tuple namespaces ────────────────────────────────────────────────────
+ *
+ * Applied in the forked child, before exec, so the namespaces live and die
+ * with one tuple.
+ *
+ * Why per tuple rather than once at startup. A tuple is a self-contained unit
+ * of work -- that is the tuple space's premise, and the runtime already holds
+ * it for memory (fixed buffers, no heap per tuple) and for process identity (a
+ * fresh fork per handler). The process TREE was the place it leaked: a
+ * handler's own children could outlive it, get reparented to the actor, and
+ * accumulate across tuples that were supposed to be independent. A namespace
+ * created here closes that: when the handler exits, the kernel kills whatever
+ * remains inside it. The tuple leaves no trace, which is what the model
+ * claimed in the first place.
+ *
+ * The PID namespace needs care, and is the reason this function forks.
+ * unshare(CLONE_NEWPID) does NOT move the caller into the new namespace: it
+ * arranges for the caller's NEXT fork to produce a child that is PID 1 of it,
+ * and the namespace is destroyed when that PID 1 exits. So unsharing and then
+ * exec'ing in the same process leaves the handler outside the namespace it
+ * just made -- the namespace exists, is empty, and confines nothing.
+ *
+ * Hence the second fork below. The caller unshares, forks, and the grandchild
+ * -- which IS pid 1 of the new namespace -- becomes the handler. The
+ * intermediate process waits and relays the exit status, so the runtime's
+ * existing view of "the child I forked exited with status N" is unchanged and
+ * the reaper, retry and rejection paths need no adjustment.
+ *
+ * Placing this per tuple rather than at startup matters for the same reason:
+ * called once at startup the first handler would be pid 1, the namespace would
+ * die with it, and every later tuple would fork into a dead namespace.
+ *
+ * Cost is tens of microseconds against a fork/exec measured in the hundreds of
+ * milliseconds for a statically linked handler. Not measurable. The mount
+ * namespace with pivot_root is the exception and is not part of this phase.
+ *
+ * Returns 0 on success. On failure the caller _exits non-zero, which the
+ * existing retry path already treats as a failed handler run -- no new error
+ * channel, and a tuple never runs less isolated than configured.
+ */
+int actor_isolation_tuple(void) {
+    const char* spec = getenv("ACTOR_TUPLE_UNSHARE");
+    if (!spec || !*spec) return 0;
+
+    char buf[256];
+    if (strlen(spec) >= sizeof(buf)) return -1;
+    strcpy(buf, spec);
+
+    int flags = 0;
+    char* save = NULL;
+    for (char* t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        while (*t == ' ') t++;
+        if      (!strcmp(t, "pid"))   flags |= CLONE_NEWPID;
+        else if (!strcmp(t, "ipc"))   flags |= CLONE_NEWIPC;
+        else if (!strcmp(t, "uts"))   flags |= CLONE_NEWUTS;
+        else if (!strcmp(t, "net"))   flags |= CLONE_NEWNET;
+        else if (!strcmp(t, "mount")) flags |= CLONE_NEWNS;
+        else if (!*t) continue;
+        else {
+            fprintf(stderr, "[actor] isolation: unknown namespace \"%s\" in "
+                            "ACTOR_TUPLE_UNSHARE\n", t);
+            return -1;
+        }
+    }
+    if (!flags) return 0;
+
+    /* Every namespace here except user needs CAP_SYS_ADMIN. An unprivileged
+       actor gets that capability by first entering a user namespace, where it
+       is root -- so try the direct unshare, and on EPERM retry behind a user
+       namespace rather than failing an actor that could have been isolated.
+       Doing it in this order means a privileged actor never creates a user
+       namespace it does not need.
+       ACTOR_TUPLE_USERNS=0 opts out, for hosts where unprivileged user
+       namespaces are disabled and the operator would rather see the EPERM. */
+    if (unshare(flags) != 0) {
+        int first_errno = errno;
+        const char* allow_userns = getenv("ACTOR_TUPLE_USERNS");
+        int may_userns = !(allow_userns && !strcmp(allow_userns, "0"));
+
+        if (first_errno == EPERM && may_userns && !(flags & CLONE_NEWUSER)) {
+            if (unshare(CLONE_NEWUSER) == 0 && unshare(flags) == 0) {
+                /* Map this uid/gid into the new namespace so the handler runs
+                   as a real user rather than nobody. Best effort: a handler
+                   that does not care about its own uid works either way, and
+                   setgroups must be denied before gid_map may be written. */
+                uid_t u = getuid(); gid_t g = getgid();
+                char m[64]; int fd;
+                if ((fd = open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC)) >= 0) {
+                    ssize_t w = write(fd, "deny", 4); (void)w; close(fd);
+                }
+                int n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)u, (unsigned)u);
+                if ((fd = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC)) >= 0) {
+                    ssize_t w = write(fd, m, (size_t)n); (void)w; close(fd);
+                }
+                n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)g, (unsigned)g);
+                if ((fd = open("/proc/self/gid_map", O_WRONLY | O_CLOEXEC)) >= 0) {
+                    ssize_t w = write(fd, m, (size_t)n); (void)w; close(fd);
+                }
+                goto unshared;
+            }
+        }
+        fprintf(stderr, "[actor] isolation: unshare(ACTOR_TUPLE_UNSHARE=%s): %s%s\n",
+                spec, strerror(first_errno),
+                first_errno == EPERM
+                    ? " (needs CAP_SYS_ADMIN, or unprivileged user namespaces enabled)"
+                    : "");
+        return -1;
+    }
+unshared:;
+
+    /* Without CLONE_NEWPID nothing more is needed: the remaining namespaces
+       take effect on the calling process immediately, and the caller execs. */
+    if (!(flags & CLONE_NEWPID)) return 0;
+
+    /* CLONE_NEWPID needs the extra fork described above: this process is not
+       in the namespace it just created, but its next child is pid 1 of it. */
+    pid_t inner = fork();
+    if (inner < 0) {
+        fprintf(stderr, "[actor] isolation: fork into pid namespace: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (inner == 0) {
+        /* pid 1 of the new namespace. /proc still shows the host's process
+           list until it is remounted, which needs a mount namespace -- so only
+           when one was also asked for. Without it the process tree is still
+           confined; only the /proc view is stale. */
+        if (flags & CLONE_NEWNS) {
+            if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
+                mount("proc", "/proc", "proc", 0, NULL) != 0) {
+                fprintf(stderr, "[actor] isolation: remount /proc: %s\n", strerror(errno));
+                _exit(1);
+            }
+        }
+        return 0;   /* caller execs the handler here, as pid 1 */
+    }
+
+    /* Intermediate process: wait for pid 1 and exit with the same status, so
+       the runtime sees exactly the exit it would have seen without any of
+       this. When pid 1 exits the kernel kills everything else in the
+       namespace -- which is the whole point: the tuple leaves no trace. */
+    int st = 0;
+    while (waitpid(inner, &st, 0) < 0 && errno == EINTR) { }
+    if (WIFEXITED(st))   _exit(WEXITSTATUS(st));
+    if (WIFSIGNALED(st)) _exit(128 + WTERMSIG(st));
+    _exit(1);
+}
 
 /* ── cgroup v2 ───────────────────────────────────────────────────────────────
  *

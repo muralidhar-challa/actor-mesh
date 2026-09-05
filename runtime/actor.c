@@ -503,6 +503,12 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         setenv("ACTOR_TUPLE_ORIGIN",   env->origin,   1);
         setenv("ACTOR_ATTEMPT",        env->attempt,  1);
 
+        /* Per-tuple namespaces, before exec so they live and die with this one
+           tuple. A failure here must not become a handler that runs anyway:
+           _exit non-zero is already how this path reports a failed run, and
+           the retry/rejection logic upstream handles it unchanged. */
+        if (actor_isolation_tuple() != 0) _exit(1);
+
         dup2(to_child[0],   STDIN_FILENO);
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
