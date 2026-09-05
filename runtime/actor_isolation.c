@@ -454,9 +454,19 @@ unshared:;
             const char* rootfs = getenv("ACTOR_ROOTFS");
             if (rootfs && *rootfs && do_pivot_root(rootfs) != 0) _exit(1);
 
+            /* A fresh /proc so it reflects the new pid namespace. This is a
+               convenience, not the boundary: pivot_root above is what confines
+               the handler, and the pid namespace confines the process tree
+               whether or not /proc shows it. Mounting proc needs privilege
+               that many environments withhold even from root -- container
+               runtimes commonly block mount(2) outright -- so a failure here
+               leaves a stale /proc view and is reported, not fatal.
+               Failing the tuple instead would make phase 6 unusable anywhere
+               mount(2) is filtered, for no gain in confinement. */
             if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
-                fprintf(stderr, "[actor] isolation: mount(/proc): %s\n", strerror(errno));
-                _exit(1);
+                fprintf(stderr, "[actor] isolation: /proc not remounted (%s); the pid "
+                                "namespace still confines the handler, but /proc shows "
+                                "the outer namespace's processes\n", strerror(errno));
             }
         }
         return 0;   /* caller execs the handler here, as pid 1 */

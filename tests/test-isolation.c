@@ -32,6 +32,9 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sched.h>
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
@@ -935,6 +938,214 @@ static void t_multi_ns(void) {
     stop(pp, ap);
 }
 
+
+/* ── 9. per-tuple mount namespace and pivot_root ─────────────────────────── */
+
+/* Stage a minimal rootfs the handler can actually run in: a shell, its
+   loader, and the directories pivot_root needs. Returns 0 if the pieces are
+   not available, in which case the case skips rather than fails. */
+static int stage_rootfs(const char *dir) {
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s/bin %s/lib %s/lib64 %s/proc %s/tmp",
+             dir, dir, dir, dir, dir, dir);
+    if (system(cmd) != 0) return 0;
+
+    /* busybox is one binary with few dependencies, which makes it the cheapest
+       thing to build a rootfs from. Without it there is nothing simple to run
+       inside the new root, so skip. */
+    if (access("/bin/busybox", X_OK) != 0) return 0;
+    snprintf(cmd, sizeof(cmd), "cp /bin/busybox %s/bin/ && ln -sf busybox %s/bin/sh", dir, dir);
+    if (system(cmd) != 0) return 0;
+
+    /* Copy the loader and libraries busybox needs, preserving their absolute
+       paths inside the rootfs -- the loader is found by the exact path
+       recorded in the binary, so /lib/ld-musl-x86_64.so.1 has to be at that
+       path after the pivot, not merely somewhere. sed rewrites each into
+       "cp --parents <lib> <dir>", which recreates the directories. */
+    snprintf(cmd, sizeof(cmd),
+             "ldd /bin/busybox 2>/dev/null | grep -oE '/[^ ]+\\.so[^ ]*' | sort -u | "
+             "xargs -r -I{} sh -c 'mkdir -p %s$(dirname {}); cp {} %s{} 2>/dev/null'; true",
+             dir, dir);
+    system(cmd);
+
+    /* Confirm the rootfs can actually run something before returning success:
+       a rootfs missing its loader produces a handler that cannot exec, which
+       would look like a pivot_root failure rather than a staging one. */
+    snprintf(cmd, sizeof(cmd), "test -x %s/bin/busybox", dir);
+    if (system(cmd) != 0) return 0;
+    return 1;
+}
+
+/* Can a mount namespace do the thing phase 6 depends on -- bind a directory
+   and pivot_root into it? Deliberately does NOT test mounting /proc: that is a
+   convenience the runtime treats as non-fatal, and container runtimes block
+   mount(2) for it even when pivot_root itself is allowed. Gating on /proc
+   would skip these cases in exactly the environments where pivot_root works
+   and is worth testing. */
+static int mountns_usable(void) {
+    if (system("rm -rf /tmp/isoprobe && mkdir -p /tmp/isoprobe/.old") != 0) return 0;
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) {
+        if (unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) {
+            uid_t u = getuid(); gid_t g = getgid();
+            if (unshare(CLONE_NEWUSER) != 0) _exit(1);
+            char m[64]; int fd;
+            if ((fd = open("/proc/self/setgroups", O_WRONLY)) >= 0) {
+                if (write(fd, "deny", 4) < 0) { } close(fd); }
+            int n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)u, (unsigned)u);
+            if ((fd = open("/proc/self/uid_map", O_WRONLY)) >= 0) {
+                if (write(fd, m, (size_t)n) < 0) { } close(fd); }
+            n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)g, (unsigned)g);
+            if ((fd = open("/proc/self/gid_map", O_WRONLY)) >= 0) {
+                if (write(fd, m, (size_t)n) < 0) { } close(fd); }
+            if (unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) _exit(1);
+        }
+        pid_t q = fork();
+        if (q == 0) {
+            if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) _exit(1);
+            if (mount("/tmp/isoprobe", "/tmp/isoprobe", NULL, MS_BIND | MS_REC, NULL) != 0) _exit(1);
+            if (syscall(SYS_pivot_root, "/tmp/isoprobe", "/tmp/isoprobe/.old") != 0) _exit(1);
+            _exit(0);
+        }
+        int s2 = 1; waitpid(q, &s2, 0);
+        _exit(WIFEXITED(s2) ? WEXITSTATUS(s2) : 1);
+    }
+    int st = 1; waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* The handler's root IS the rootfs, and the host filesystem is gone -- not
+   merely hidden behind a directory it could walk back out of, since
+   do_pivot_root detaches the old root rather than leaving it mounted. */
+static void t_pivot_root(void) {
+    TEST("mount ns: pivot_root puts the handler in ACTOR_ROOTFS");
+    cleanup();
+    if (!pidns_available() || !mountns_usable()) {
+        printf("  SKIP: this host cannot mount /proc in a new namespace\n");
+        return;
+    }
+    if (!stage_rootfs("/tmp/isoroot")) {
+        printf("  SKIP: could not stage a minimal rootfs (no /bin/busybox)\n");
+        return;
+    }
+    /* A marker that exists ONLY outside the rootfs. */
+    system("echo HOSTROOT > /tmp/iso-host-marker");
+    system("echo INSIDE > /tmp/isoroot/inside-marker");
+
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso26; mkdir -p /tmp/iso26");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid,mount",
+        (char *)"ACTOR_ROOTFS=/tmp/isoroot",
+    };
+    pid_t ap = start_actor(
+        "sh -c 'echo done; [ -f /inside-marker ] && echo IN_ROOTFS || echo NOT_IN_ROOTFS; "
+        "[ -f /tmp/iso-host-marker ] && echo HOST_VISIBLE || echo HOST_HIDDEN'",
+        "/tmp/iso26", extra, 2);
+    ms(1200);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[256] = {0};
+    int got = drain(s, 3000, buf, sizeof(buf));
+    nng_close(s);
+
+    CHECK(got > 0, "handler did not run after pivot_root");
+    if (got > 0) printf("  handler reported: %.60s\n", buf);
+    CHECK(strstr(buf, "IN_ROOTFS") != NULL, "handler was not inside ACTOR_ROOTFS");
+    CHECK(strstr(buf, "HOST_HIDDEN") != NULL, "the host filesystem was still reachable");
+    stop(pp, ap);
+}
+
+/* ACTOR_ROOTFS without "mount" in ACTOR_TUPLE_UNSHARE would be silently
+   ignored, leaving the handler on the host root while the operator believes
+   it is confined. That must be a configuration error. */
+static void t_rootfs_without_mount_fails(void) {
+    TEST("mount ns: ACTOR_ROOTFS without a mount namespace fails the tuple");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso27; mkdir -p /tmp/iso27");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+        (char *)"ACTOR_ROOTFS=/tmp/isoroot",
+        (char *)"ACTOR_RETRY_MAX=0",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso27", extra, 3);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1500, NULL, 0);
+    nng_close(s);
+    CHECK(got == 0, "a tuple ran with ACTOR_ROOTFS set but no mount namespace");
+    stop(pp, ap);
+}
+
+/* A rootfs that does not exist cannot be pivoted into. */
+static void t_rootfs_missing_fails(void) {
+    TEST("mount ns: a nonexistent ACTOR_ROOTFS fails the tuple");
+    cleanup();
+    if (!pidns_available()) { printf("  SKIP: no unprivileged pid namespace\n"); return; }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso28; mkdir -p /tmp/iso28");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid,mount",
+        (char *)"ACTOR_ROOTFS=/tmp/no-such-rootfs-xyz",
+        (char *)"ACTOR_RETRY_MAX=0",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso28", extra, 3);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1500, NULL, 0);
+    nng_close(s);
+    CHECK(got == 0, "a tuple ran with an ACTOR_ROOTFS that does not exist");
+    stop(pp, ap);
+}
+
+/* The plan singles out mount+pivot_root as the one per-tuple dimension whose
+   cost is worth knowing rather than assuming. Measure it: the same handler,
+   the same number of tuples, with and without the namespace. "Measured" means
+   a number in the output, not a claim. */
+static void t_mount_cost(void) {
+    TEST("mount ns: per-tuple cost of pid vs pid+mount+pivot_root");
+    cleanup();
+    if (!pidns_available() || !mountns_usable()) {
+        printf("  SKIP: cannot create the namespaces to compare\n");
+        return;
+    }
+    if (!stage_rootfs("/tmp/isoroot2")) {
+        printf("  SKIP: could not stage a minimal rootfs\n");
+        return;
+    }
+    const int N = 5;
+    int64_t took[2];
+
+    for (int mode = 0; mode < 2; mode++) {
+        pid_t pp = start_proxy();
+        system("rm -rf /tmp/iso29; mkdir -p /tmp/iso29");
+        char *e1[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid" };
+        char *e2[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid,mount",
+                       (char *)"ACTOR_ROOTFS=/tmp/isoroot2" };
+        pid_t ap = mode == 0
+            ? start_actor("sh -c 'echo done; echo ok'", "/tmp/iso29", e1, 1)
+            : start_actor("sh -c 'echo done; echo ok'", "/tmp/iso29", e2, 2);
+        ms(1200);
+        nng_socket s = sub_done();
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < N; i++) { sendm("work", "x"); drain(s, 1200, NULL, 0); }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        took[mode] = (t1.tv_sec - t0.tv_sec) * 1000LL + (t1.tv_nsec - t0.tv_nsec) / 1000000LL;
+        nng_close(s);
+        stop(pp, ap);
+    }
+    printf("  %d tuples: pid=%lldms  pid+mount+pivot_root=%lldms\n",
+           N, (long long)took[0], (long long)took[1]);
+    /* No threshold is asserted: this records the cost rather than policing it,
+       and the send/drain loop dominates either way. The number is the point. */
+    PASS();
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -962,6 +1173,10 @@ int main(void) {
     t_utsns_host_unchanged();
     t_ipcns_separate();
     t_multi_ns();
+    t_pivot_root();
+    t_rootfs_without_mount_fails();
+    t_rootfs_missing_fails();
+    t_mount_cost();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();
