@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 /* test-isolation.c — ACTOR_* confinement, phase 1.
  *
@@ -30,6 +31,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sched.h>
 #include <time.h>
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
@@ -561,6 +563,204 @@ static void t_cgroup_missing_fails(void) {
     stop(pp, -1);
 }
 
+
+/* ── 7. per-tuple PID namespace ──────────────────────────────────────────── */
+
+/* Is a per-tuple pid namespace achievable at all here? Unprivileged
+   unshare(CLONE_NEWPID) needs either CAP_SYS_ADMIN or a user namespace to get
+   it from. Where neither is available the cases skip rather than fail: they
+   would be testing the host's configuration, not this code. */
+static int pidns_available(void) {
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) {
+        if (unshare(CLONE_NEWPID) == 0) _exit(0);
+        if (unshare(CLONE_NEWUSER) == 0 && unshare(CLONE_NEWPID) == 0) _exit(0);
+        _exit(1);
+    }
+    int st = 1;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* The handler is pid 1 of its own namespace.
+ *
+ * This is also the regression test for putting the unshare in the wrong place.
+ * With it at startup the FIRST handler would be pid 1 and the namespace would
+ * die with it, so a second tuple would fork into a dead namespace. Two tuples
+ * are sent and both must report pid 1. */
+static void t_pidns_fresh_per_tuple(void) {
+    TEST("pid ns: every tuple's handler is pid 1 of a fresh namespace");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso16; mkdir -p /tmp/iso16");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid" };
+    /* $$ is the shell's own pid, which is 1 inside a fresh pid namespace. */
+    pid_t ap = start_actor("sh -c 'echo done; echo $$'", "/tmp/iso16", extra, 1);
+    ms(900);
+
+    nng_socket s = sub_done();
+    char a[128] = {0}, b[128] = {0};
+    sendm("work", "one");
+    int g1 = drain(s, 2000, a, sizeof(a));
+    sendm("work", "two");
+    int g2 = drain(s, 2000, b, sizeof(b));
+    nng_close(s);
+
+    CHECK(g1 > 0 && g2 > 0, "handlers did not run under a pid namespace");
+    printf("  tuple 1 handler pid=%s tuple 2 handler pid=%s\n",
+           g1 > 0 ? a : "?", g2 > 0 ? b : "?");
+    CHECK(atoi(a) == 1, "first handler was not pid 1 of a new namespace");
+    CHECK(atoi(b) == 1, "second handler was not pid 1 -- the namespace is not per tuple");
+    stop(pp, ap);
+}
+
+/* The property the phase exists for: the tuple leaves no trace.
+ *
+ * The handler starts a background child that would outlive it, then exits.
+ * Without a pid namespace that child is reparented to the actor and lingers --
+ * the zombie accumulation the reaper's comment in actor.c records. With one,
+ * the kernel kills it when the handler (pid 1 of the namespace) exits.
+ *
+ * The child writes to a file after a delay; if it survived, the file appears. */
+static void t_pidns_no_survivors(void) {
+    TEST("pid ns: a background child does not outlive its tuple");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso17; mkdir -p /tmp/iso17");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso17",
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
+    };
+    /* The background child sleeps past the handler's exit, then leaves a mark. */
+    pid_t ap = start_actor(
+        "sh -c '(sleep 2; echo SURVIVED > /tmp/iso17/mark) & echo done; echo started'",
+        "/tmp/iso17", extra, 3);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1500, NULL, 0);
+    nng_close(s);
+    CHECK(got > 0, "handler did not run");
+
+    /* Wait past the child's sleep. If the namespace did its job the child was
+       killed with it and never wrote the file. */
+    ms(3200);
+    CHECK(access("/tmp/iso17/mark", F_OK) != 0,
+          "a background child outlived its tuple's namespace");
+    stop(pp, ap);
+}
+
+/* Concurrent tuples must not share a namespace: each handler is pid 1 of its
+   own, and none can see the others. */
+static void t_pidns_concurrent(void) {
+    TEST("pid ns: concurrent handlers each get their own namespace");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso18; mkdir -p /tmp/iso18");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+        (char *)"ACTOR_CONCURRENCY=4",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo $$'", "/tmp/iso18", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    for (int i = 0; i < 4; i++) sendm("work", "x");
+    char first[128] = {0};
+    int got = drain(s, 3000, first, sizeof(first));
+    nng_close(s);
+    CHECK(got == 4, "not every concurrent tuple produced a result");
+    CHECK(atoi(first) == 1, "a concurrent handler was not pid 1 of its own namespace");
+    stop(pp, ap);
+}
+
+/* Handler success and failure must still propagate correctly with namespaces
+   active -- the property test-concurrency.c defends, re-run under phase 4. */
+static void t_pidns_failure_still_fails(void) {
+    TEST("pid ns: a failing handler is still a failure");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso19; mkdir -p /tmp/iso19");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+        (char *)"ACTOR_CONCURRENCY=4",
+        (char *)"ACTOR_RETRY_MAX=0",
+    };
+    pid_t ap = start_actor("sh -c 'exit 3'", "/tmp/iso19", extra, 3);
+    ms(900);
+    nng_socket r; nng_sub0_open(&r); nng_dial(r, SP, NULL, 0);
+    nng_socket_set(r, NNG_OPT_SUB_SUBSCRIBE, "tuple_rejected", 15);
+    nng_socket_set_ms(r, NNG_OPT_RECVTIMEO, 120);
+    nng_socket d = sub_done();
+    ms(150);
+    for (int i = 0; i < 4; i++) sendm("work", "x");
+    int rejected = drain(r, 3000, NULL, 0);
+    int succeeded = drain(d, 300, NULL, 0);
+    nng_close(r); nng_close(d);
+    printf("  rejected=%d succeeded=%d (expect 4/0)\n", rejected, succeeded);
+    CHECK(rejected == 4, "failing handlers under a namespace were not rejected");
+    CHECK(succeeded == 0, "a failing handler under a namespace was called a success");
+    stop(pp, ap);
+}
+
+/* An unknown namespace name is a configuration error. Ignoring it would run
+   the tuple less isolated than asked. */
+static void t_tuple_unknown_ns_fails(void) {
+    TEST("pid ns: an unknown namespace name fails the tuple");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso20; mkdir -p /tmp/iso20");
+    char *extra[] = {
+        (char *)"ACTOR_TUPLE_UNSHARE=pid,bogus",
+        (char *)"ACTOR_RETRY_MAX=0",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso20", extra, 2);
+    ms(900);
+    nng_socket d = sub_done();
+    sendm("work", "x");
+    int got = drain(d, 1500, NULL, 0);
+    nng_close(d);
+    CHECK(got == 0, "a tuple ran despite an unknown namespace in ACTOR_TUPLE_UNSHARE");
+    stop(pp, ap);
+}
+
+/* Absent is unchanged, at tuple scope: without the variable the handler runs
+   with the host's pids as it always did. */
+static void t_tuple_absent_unchanged(void) {
+    TEST("pid ns: absent ACTOR_TUPLE_UNSHARE leaves the handler unnamespaced");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso21; mkdir -p /tmp/iso21");
+    pid_t ap = start_actor("sh -c 'echo done; echo $$'", "/tmp/iso21", NULL, 0);
+    ms(700);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 1500, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "no result");
+    CHECK(atoi(buf) > 1, "handler was pid 1 without ACTOR_TUPLE_UNSHARE set");
+    if (got > 0) printf("  handler pid = %d (host namespace)\n", atoi(buf));
+    stop(pp, ap);
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -578,6 +778,12 @@ int main(void) {
     t_landlock_bad_port_fails();
     t_cgroup_join();
     t_cgroup_missing_fails();
+    t_tuple_absent_unchanged();
+    t_pidns_fresh_per_tuple();
+    t_pidns_no_survivors();
+    t_pidns_concurrent();
+    t_pidns_failure_still_fails();
+    t_tuple_unknown_ns_fails();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();
