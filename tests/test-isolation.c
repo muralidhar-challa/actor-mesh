@@ -1146,6 +1146,138 @@ static void t_mount_cost(void) {
     PASS();
 }
 
+
+/* ── 10. seccomp ─────────────────────────────────────────────────────────── */
+
+/* A normal handler is unaffected. The filter is a denylist of calls no handler
+   has a reason to make, so ordinary work must be untouched -- if this fails
+   the filter is too broad and nothing else about it matters. */
+static void t_seccomp_normal_work(void) {
+    TEST("seccomp: an ordinary handler is unaffected");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso30; mkdir -p /tmp/iso30");
+    char *extra[] = { (char *)"ACTOR_SECCOMP=1" };
+    /* Deliberately busy: pipes, a subshell, file IO, an external binary. */
+    pid_t ap = start_actor(
+        "sh -c 'echo done; x=$(echo hello | tr a-z A-Z); echo $x > /tmp/iso30/f; cat /tmp/iso30/f'",
+        "/tmp/iso30", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "seccomp broke an ordinary handler");
+    CHECK(strstr(buf, "HELLO") != NULL, "handler output was wrong under seccomp");
+    stop(pp, ap);
+}
+
+/* The filter blocks what it claims to. unshare(2) is in the denied set and is
+   reachable from a shell, so it is the one that can be provoked without
+   writing a C probe. The handler reports which way it went, so a filter that
+   silently allowed it would show up as ALLOWED rather than as a pass. */
+static void t_seccomp_denies(void) {
+    TEST("seccomp: a denied syscall is refused inside the handler");
+    cleanup();
+    if (system("command -v unshare >/dev/null 2>&1") != 0) {
+        printf("  SKIP: no unshare(1) available to provoke the syscall\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso31; mkdir -p /tmp/iso31");
+    char *extra[] = { (char *)"ACTOR_SECCOMP=1" };
+    pid_t ap = start_actor(
+        "sh -c 'echo done; unshare -U true 2>/dev/null && echo ALLOWED || echo DENIED'",
+        "/tmp/iso31", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "no result");
+    if (got > 0) printf("  handler reported: %.20s\n", buf);
+    CHECK(strstr(buf, "DENIED") != NULL, "a denied syscall was allowed through the filter");
+    stop(pp, ap);
+}
+
+/* The phase 6 / phase 7 coupling the plan flagged. seccomp is installed at
+   startup and inherited by the forked child, where phase 6 needs mount and
+   pivot_root. ACTOR_SECCOMP=1 alongside ACTOR_TUPLE_UNSHARE must be refused at
+   startup rather than breaking phase 6 as a mysterious handler failure. */
+static void t_seccomp_mount_conflict(void) {
+    TEST("seccomp: ACTOR_SECCOMP=1 with per-tuple namespaces is refused");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso32; mkdir -p /tmp/iso32");
+    char *extra[] = {
+        (char *)"ACTOR_SECCOMP=1",
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso32", extra, 2);
+    CHECK(exited(ap), "actor started with a seccomp filter that would break its own namespaces");
+    stop(pp, -1);
+}
+
+/* permissive_mount is the resolution: the mount family stays allowed so the
+   per-tuple namespaces work, while everything else in the denylist still
+   applies. Both halves are asserted -- the namespaces work AND the filter is
+   still doing its job. */
+static void t_seccomp_permissive_mount(void) {
+    TEST("seccomp: permissive_mount allows namespaces and still denies ptrace");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso33; mkdir -p /tmp/iso33");
+    char *extra[] = {
+        (char *)"ACTOR_SECCOMP=permissive_mount",
+        (char *)"ACTOR_TUPLE_UNSHARE=pid",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo $$'", "/tmp/iso33", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2500, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "permissive_mount broke the per-tuple namespace");
+    CHECK(atoi(buf) == 1, "handler was not pid 1 under permissive_mount");
+    stop(pp, ap);
+}
+
+/* An unrecognised mode is a configuration error, not something to ignore --
+   ACTOR_SECCOMP=yes must not silently mean "no filter". */
+static void t_seccomp_bad_mode_fails(void) {
+    TEST("seccomp: an unrecognised ACTOR_SECCOMP value fails closed");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso34; mkdir -p /tmp/iso34");
+    char *extra[] = { (char *)"ACTOR_SECCOMP=yes" };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso34", extra, 1);
+    CHECK(exited(ap), "actor kept running with an unrecognised ACTOR_SECCOMP value");
+    stop(pp, -1);
+}
+
+/* Absent is unchanged. */
+static void t_seccomp_absent(void) {
+    TEST("seccomp: absent ACTOR_SECCOMP leaves the handler unfiltered");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso35; mkdir -p /tmp/iso35");
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso35", NULL, 0);
+    ms(700);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1500, NULL, 0);
+    nng_close(s);
+    CHECK(got > 0, "actor without ACTOR_SECCOMP did not serve a tuple");
+    stop(pp, ap);
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -1177,6 +1309,12 @@ int main(void) {
     t_rootfs_without_mount_fails();
     t_rootfs_missing_fails();
     t_mount_cost();
+    t_seccomp_absent();
+    t_seccomp_normal_work();
+    t_seccomp_denies();
+    t_seccomp_mount_conflict();
+    t_seccomp_permissive_mount();
+    t_seccomp_bad_mode_fails();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();

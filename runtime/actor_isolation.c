@@ -811,6 +811,292 @@ static int apply_landlock(void) {
     return 0;
 }
 
+
+/* ── seccomp ─────────────────────────────────────────────────────────────────
+ *
+ * A denylist, not an allowlist, and that is a deliberate reversal of the usual
+ * advice.
+ *
+ * An allowlist is stronger in principle. It is also unmaintainable here: the
+ * handler contract is "any process that speaks stdio", so the syscall set is
+ * whatever an arbitrary program in an arbitrary language needs. Tracing the
+ * runtime plus two shell handlers on musl already gives 57 distinct calls, and
+ * that set shifts with libc, with the language, and with what the handler
+ * does. An allowlist tuned to it would fail closed on the first handler that
+ * did something ordinary and unanticipated -- a handler dying with SIGSYS for
+ * reasons that look unrelated to anything the operator changed.
+ *
+ * What CAN be enumerated exactly is the set of calls no handler has a
+ * legitimate reason to make, and which are the ones that matter for escaping
+ * confinement or attacking a neighbour:
+ *
+ *   ptrace, process_vm_readv/writev   read or write another process's memory
+ *   kcmp                              compare another process's resources
+ *   perf_event_open                   trace the system
+ *   bpf                               load kernel programs; also how an actor
+ *                                     could try to lift its own restrictions
+ *   userfaultfd                       a classic exploit primitive
+ *   kexec_load, kexec_file_load       replace the running kernel
+ *   init_module, finit_module,
+ *   delete_module                     load kernel code
+ *   pivot_root, chroot                change the root -- the runtime does this
+ *                                     itself in phase 6, BEFORE this filter is
+ *                                     installed, so denying it here does not
+ *                                     conflict (see the note below)
+ *   mount, umount2, move_mount,
+ *   open_tree, fsopen, fsconfig,
+ *   fsmount                           remount the filesystem out from under
+ *                                     the Landlock ruleset
+ *   setns, unshare                    join or create namespaces -- an actor
+ *                                     that could unshare after this filter is
+ *                                     installed could undo phase 4's confinement
+ *   add_key, keyctl, request_key      the kernel keyring
+ *   swapon, swapoff, reboot           system-level operations
+ *
+ * Ordering with phase 6 is the subtle part, and the plan called it out as a
+ * coupling to resolve. It resolves cleanly because the two run at different
+ * scopes: this filter is installed once at actor STARTUP, while the mount and
+ * pivot_root calls happen per TUPLE, in the forked child. seccomp filters are
+ * inherited across fork, so a naive reading says the child's pivot_root would
+ * be blocked by the parent's filter -- and it would. Hence
+ * ACTOR_SECCOMP=permissive_mount, which keeps the mount family allowed for
+ * deployments that use ACTOR_ROOTFS, and a startup check that refuses the
+ * contradictory combination outright rather than letting phase 6 break in a
+ * way that surfaces as a failed handler.
+ *
+ * SCMP_ACT_ERRNO(EPERM) rather than SIGSYS: a handler that gets EPERM from
+ * ptrace can report a sensible error, while one killed by SIGSYS looks like a
+ * crash. The runtime treats both as a failed tuple, but the former is far
+ * easier to diagnose.
+ */
+
+/* Minimal seccomp-bpf. No libseccomp dependency: the filter is a fixed
+   sequence of "if nr == X return EPERM", which is a few lines of BPF and
+   avoids adding a library to a runtime whose whole premise is having none. */
+#ifndef SECCOMP_MODE_FILTER
+#  define SECCOMP_MODE_FILTER 2
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#  define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef AUDIT_ARCH_X86_64
+#  define AUDIT_ARCH_X86_64 0xc000003e
+#endif
+#ifndef AUDIT_ARCH_AARCH64
+#  define AUDIT_ARCH_AARCH64 0xc00000b7
+#endif
+
+#if defined(__x86_64__)
+#  define ACTOR_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#  define ACTOR_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#  define ACTOR_AUDIT_ARCH 0
+#endif
+
+struct actor_sock_filter { uint16_t code; uint8_t jt; uint8_t jf; uint32_t k; };
+struct actor_sock_fprog  { unsigned short len; struct actor_sock_filter* filter; };
+
+/* Classic BPF opcodes, spelled out rather than pulled from linux/filter.h,
+   which is another header alpine does not ship without linux-headers. */
+#define BPF_LD_W_ABS   0x20
+#define BPF_JMP_JEQ_K  0x15
+#define BPF_JMP_JA     0x05
+#define BPF_RET_K      0x06
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#define SECCOMP_RET_ERRNO 0x00050000U
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+
+/* Offsets into struct seccomp_data. */
+#define SD_NR   0
+#define SD_ARCH 4
+
+/* Syscalls denied to every actor and every handler. Named by __NR_*, and
+   skipped when a number is not defined for this architecture. */
+static const int g_denied[] = {
+#ifdef __NR_ptrace
+    __NR_ptrace,
+#endif
+#ifdef __NR_process_vm_readv
+    __NR_process_vm_readv,
+#endif
+#ifdef __NR_process_vm_writev
+    __NR_process_vm_writev,
+#endif
+#ifdef __NR_kcmp
+    __NR_kcmp,
+#endif
+#ifdef __NR_perf_event_open
+    __NR_perf_event_open,
+#endif
+#ifdef __NR_bpf
+    __NR_bpf,
+#endif
+#ifdef __NR_userfaultfd
+    __NR_userfaultfd,
+#endif
+#ifdef __NR_kexec_load
+    __NR_kexec_load,
+#endif
+#ifdef __NR_kexec_file_load
+    __NR_kexec_file_load,
+#endif
+#ifdef __NR_init_module
+    __NR_init_module,
+#endif
+#ifdef __NR_finit_module
+    __NR_finit_module,
+#endif
+#ifdef __NR_delete_module
+    __NR_delete_module,
+#endif
+#ifdef __NR_add_key
+    __NR_add_key,
+#endif
+#ifdef __NR_keyctl
+    __NR_keyctl,
+#endif
+#ifdef __NR_request_key
+    __NR_request_key,
+#endif
+#ifdef __NR_swapon
+    __NR_swapon,
+#endif
+#ifdef __NR_swapoff
+    __NR_swapoff,
+#endif
+#ifdef __NR_reboot
+    __NR_reboot,
+#endif
+#ifdef __NR_setns
+    __NR_setns,
+#endif
+};
+
+/* Denied unless the deployment also uses ACTOR_ROOTFS / per-tuple namespaces,
+   which need these in the forked child. See the ordering note above. */
+static const int g_denied_mount[] = {
+#ifdef __NR_mount
+    __NR_mount,
+#endif
+#ifdef __NR_umount2
+    __NR_umount2,
+#endif
+#ifdef __NR_pivot_root
+    __NR_pivot_root,
+#endif
+#ifdef __NR_chroot
+    __NR_chroot,
+#endif
+#ifdef __NR_move_mount
+    __NR_move_mount,
+#endif
+#ifdef __NR_open_tree
+    __NR_open_tree,
+#endif
+#ifdef __NR_fsopen
+    __NR_fsopen,
+#endif
+#ifdef __NR_fsconfig
+    __NR_fsconfig,
+#endif
+#ifdef __NR_fsmount
+    __NR_fsmount,
+#endif
+#ifdef __NR_unshare
+    __NR_unshare,
+#endif
+};
+
+static int apply_seccomp(void) {
+    const char* mode = getenv("ACTOR_SECCOMP");
+    if (!mode || !*mode || !strcmp(mode, "0")) return 0;
+
+    int permissive_mount = !strcmp(mode, "permissive_mount");
+    if (strcmp(mode, "1") && !permissive_mount) {
+        fprintf(stderr, "[actor] isolation: ACTOR_SECCOMP=\"%s\" is not recognised "
+                        "(use 1, or permissive_mount when ACTOR_ROOTFS or "
+                        "ACTOR_TUPLE_UNSHARE is in use)\n", mode);
+        return -1;
+    }
+
+    if (ACTOR_AUDIT_ARCH == 0) {
+        fprintf(stderr, "[actor] isolation: ACTOR_SECCOMP is not supported on this "
+                        "architecture\n");
+        return -1;
+    }
+
+    /* The contradiction the plan flagged: a filter that blocks the mount family
+       is inherited by the forked child, where phase 6 needs it. Refuse rather
+       than let phase 6 break as a mysterious handler failure. */
+    const char* tuple_ns = getenv("ACTOR_TUPLE_UNSHARE");
+    if (!permissive_mount && tuple_ns && *tuple_ns) {
+        fprintf(stderr, "[actor] isolation: ACTOR_SECCOMP=1 blocks unshare and the mount "
+                        "family, which ACTOR_TUPLE_UNSHARE=%s needs in the forked child. "
+                        "Use ACTOR_SECCOMP=permissive_mount, or drop one of the two.\n",
+                tuple_ns);
+        return -1;
+    }
+
+    size_t n_deny = sizeof(g_denied) / sizeof(g_denied[0]);
+    size_t n_mount = permissive_mount ? 0 : sizeof(g_denied_mount) / sizeof(g_denied_mount[0]);
+    size_t total   = n_deny + n_mount;
+
+    /* 2 instructions of arch check + 1 load of nr + 2 per denied call + 1
+       trailing allow. */
+    size_t max_insns = 4 + total * 2 + 2;
+    struct actor_sock_filter* f = calloc(max_insns, sizeof(*f));
+    if (!f) {
+        fprintf(stderr, "[actor] isolation: seccomp filter allocation failed\n");
+        return -1;
+    }
+
+    size_t i = 0;
+    /* Reject any architecture but the one this binary was built for: syscall
+       numbers differ per arch, so a filter written for one is meaningless --
+       and silently wrong -- under another. */
+    f[i++] = (struct actor_sock_filter){ BPF_LD_W_ABS, 0, 0, SD_ARCH };
+    f[i++] = (struct actor_sock_filter){ BPF_JMP_JEQ_K, 1, 0, (uint32_t)ACTOR_AUDIT_ARCH };
+    f[i++] = (struct actor_sock_filter){ BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS };
+    f[i++] = (struct actor_sock_filter){ BPF_LD_W_ABS, 0, 0, SD_NR };
+
+    for (size_t d = 0; d < n_deny; d++) {
+        f[i++] = (struct actor_sock_filter){ BPF_JMP_JEQ_K, 0, 1, (uint32_t)g_denied[d] };
+        f[i++] = (struct actor_sock_filter){ BPF_RET_K, 0, 0,
+                                             SECCOMP_RET_ERRNO | (EPERM & 0xffff) };
+    }
+    for (size_t d = 0; d < n_mount; d++) {
+        f[i++] = (struct actor_sock_filter){ BPF_JMP_JEQ_K, 0, 1, (uint32_t)g_denied_mount[d] };
+        f[i++] = (struct actor_sock_filter){ BPF_RET_K, 0, 0,
+                                             SECCOMP_RET_ERRNO | (EPERM & 0xffff) };
+    }
+    f[i++] = (struct actor_sock_filter){ BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW };
+
+    struct actor_sock_fprog prog = { (unsigned short)i, f };
+
+    /* no_new_privs is a precondition for an unprivileged seccomp filter, and
+       is set by the Landlock step when that runs. Set it unconditionally here
+       so seccomp works on its own. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "[actor] isolation: prctl(NO_NEW_PRIVS): %s\n", strerror(errno));
+        free(f);
+        return -1;
+    }
+    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0) {
+        /* Older kernels have no seccomp(2); fall back to the prctl interface. */
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) {
+            fprintf(stderr, "[actor] isolation: seccomp filter: %s\n", strerror(errno));
+            free(f);
+            return -1;
+        }
+    }
+    free(f);
+
+    fprintf(stderr, "[actor] isolation: seccomp mode=%s denied=%zu\n",
+            permissive_mount ? "permissive_mount" : "1", total);
+    return 0;
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 /* True if this process appears to have more than one thread.
@@ -845,7 +1131,8 @@ int actor_isolation_apply(void) {
         getenv("ACTOR_RLIMIT_AS")     || getenv("ACTOR_RLIMIT_CPU")  ||
         getenv("ACTOR_RLIMIT_NOFILE") || getenv("ACTOR_RLIMIT_NPROC")  ||
         getenv("ACTOR_LANDLOCK_RO")   || getenv("ACTOR_LANDLOCK_RW")   ||
-        getenv("ACTOR_LANDLOCK_NET_CONNECT") || getenv("ACTOR_CGROUP_PATH");
+        getenv("ACTOR_LANDLOCK_NET_CONNECT") || getenv("ACTOR_CGROUP_PATH") ||
+        getenv("ACTOR_SECCOMP");
     if (!requested) return 0;
 
     if (looks_multithreaded()) {
@@ -885,9 +1172,14 @@ int actor_isolation_apply(void) {
        /sys/fs/cgroup, which an operator has no reason to put in the ruleset. */
     if (join_cgroup() < 0) return -1;
 
-    /* Landlock last: it is irreversible, and everything above still needs an
-       unrestricted view of the filesystem to do its job. */
+    /* Landlock before seccomp: building the ruleset opens paths, and a
+       seccomp filter is one more thing that could interfere with that. Both
+       are irreversible, and everything above still needs an unrestricted view
+       of the filesystem to do its job. */
     if (apply_landlock() < 0) return -1;
+
+    /* seccomp last: nothing after it needs a syscall the filter might deny. */
+    if (apply_seccomp() < 0) return -1;
 
     /* One line naming what is actually in force, so an operator can tell
        isolation happened without reading the launcher's configuration. */
