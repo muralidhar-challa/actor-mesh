@@ -34,6 +34,19 @@ PROXY      = $(ROOT)/bin/mesh-proxy
 
 all: handlers
 
+# handlers had no rule despite being the default target's only prerequisite.
+# mpack-get is the one every shell handler needs: tool-registry.sh and
+# tool-bridge.sh shell out to "$BRIDGE_LIB/mpack-get" to read fields off the
+# msgpack payload, and without it they silently produce nothing -- which is
+# what made tests/test-mesh.c's registry case unrunnable from a plain build.
+handlers: handlers/lib/mpack-get handlers/lib/mpack-pack
+
+handlers/lib/mpack-get: handlers/lib/mpack-get.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) handlers/lib/mpack-get.c $(MPACK_SRCS) -o $@
+
+handlers/lib/mpack-pack: handlers/lib/mpack-pack.c $(MPACK_SRCS)
+	$(CC) $(CFLAGS) handlers/lib/mpack-pack.c $(MPACK_SRCS) -o $@
+
 handlers/agents/llm-agent: handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON)
 	$(CC) $(CFLAGS) -I$(VENDOR)/cjson handlers/agents/llm-agent.c $(MPACK_SRCS) $(CJSON) $(HANDLER_LIBS) -o $@
 

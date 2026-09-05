@@ -1,7 +1,7 @@
 /* mpack-pack — write a single key=value as mpack to stdout */
 #include <stdio.h>
 #include <string.h>
-#include "../../../vendor/mpack/mpack.h"
+#include "../../../../vendor/mpack/mpack.h"
 
 int main(int argc, char **argv) {
     if (argc != 3) return 1;
