@@ -71,6 +71,7 @@ enum landlock_rule_type {
 #include <sys/prctl.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 /* ── Environment parsing ─────────────────────────────────────────────────── */
@@ -207,6 +208,69 @@ static int drop_privilege(void) {
 
 
 
+
+/* pivot_root into ACTOR_ROOTFS.
+ *
+ * Only meaningful with a mount namespace, and only reached from inside one.
+ * After this the handler's filesystem is the rootfs and nothing above it is
+ * reachable -- the old root is unmounted rather than merely moved aside, so
+ * there is no directory left to walk back out through.
+ *
+ * pivot_root requires the new root to be a mount point, which an ordinary
+ * directory is not; the bind of the directory onto itself is what makes it
+ * one. That is the standard sequence and the reason for the apparently
+ * redundant first mount.
+ *
+ * Called before /proc is remounted, so the fresh /proc lands inside the new
+ * root rather than in a filesystem about to disappear.
+ */
+static int do_pivot_root(const char* rootfs) {
+    /* The new root must be a mount point. */
+    if (mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) != 0) {
+        fprintf(stderr, "[actor] isolation: bind ACTOR_ROOTFS=\"%s\": %s\n",
+                rootfs, strerror(errno));
+        return -1;
+    }
+
+    /* A place to park the old root while pivoting. Inside the new root, so it
+       exists after the pivot and can be unmounted from there. */
+    char oldroot[PATH_MAX];
+    int n = snprintf(oldroot, sizeof(oldroot), "%s/.actor_oldroot", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(oldroot)) {
+        fprintf(stderr, "[actor] isolation: ACTOR_ROOTFS path too long\n");
+        return -1;
+    }
+    if (mkdir(oldroot, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[actor] isolation: mkdir \"%s\": %s "
+                        "(ACTOR_ROOTFS must be writable to stage the pivot)\n",
+                oldroot, strerror(errno));
+        return -1;
+    }
+
+    if (syscall(SYS_pivot_root, rootfs, oldroot) != 0) {
+        fprintf(stderr, "[actor] isolation: pivot_root(\"%s\"): %s\n",
+                rootfs, strerror(errno));
+        return -1;
+    }
+    if (chdir("/") != 0) {
+        fprintf(stderr, "[actor] isolation: chdir(/) after pivot_root: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Detach the old root entirely. Until this succeeds the handler can still
+       reach the host filesystem through /.actor_oldroot, so a failure here is
+       a failure of the whole phase, not a cosmetic leftover. */
+    if (umount2("/.actor_oldroot", MNT_DETACH) != 0) {
+        fprintf(stderr, "[actor] isolation: umount2(old root): %s\n", strerror(errno));
+        return -1;
+    }
+    if (rmdir("/.actor_oldroot") != 0 && errno != ENOENT && errno != EBUSY) {
+        /* Cosmetic only: the mount is already detached, so this directory is
+           empty and leads nowhere. Not worth failing the tuple over. */
+    }
+    return 0;
+}
+
 /* ── Per-tuple namespaces ────────────────────────────────────────────────────
  *
  * Applied in the forked child, before exec, so the namespaces live and die
@@ -273,6 +337,24 @@ int actor_isolation_tuple(void) {
     }
     if (!flags) return 0;
 
+    /* ACTOR_ROOTFS only means anything with a mount namespace to apply it in.
+       Set without one it would be silently ignored, leaving the handler on the
+       host root while the operator believes otherwise. */
+    const char* rootfs_early = getenv("ACTOR_ROOTFS");
+    if (rootfs_early && *rootfs_early && !(flags & CLONE_NEWNS)) {
+        fprintf(stderr, "[actor] isolation: ACTOR_ROOTFS is set but \"mount\" is not in "
+                        "ACTOR_TUPLE_UNSHARE -- it would have no effect\n");
+        return -1;
+    }
+    /* pivot_root also needs a pid namespace here: the /proc remount that makes
+       the new root usable belongs to the pid-1 child, and without CLONE_NEWPID
+       that child does not exist. */
+    if (rootfs_early && *rootfs_early && !(flags & CLONE_NEWPID)) {
+        fprintf(stderr, "[actor] isolation: ACTOR_ROOTFS needs \"pid\" in "
+                        "ACTOR_TUPLE_UNSHARE alongside \"mount\"\n");
+        return -1;
+    }
+
     /* Every namespace here except user needs CAP_SYS_ADMIN. An unprivileged
        actor gets that capability by first entering a user namespace, where it
        is root -- so try the direct unshare, and on EPERM retry behind a user
@@ -287,23 +369,48 @@ int actor_isolation_tuple(void) {
         int may_userns = !(allow_userns && !strcmp(allow_userns, "0"));
 
         if (first_errno == EPERM && may_userns && !(flags & CLONE_NEWUSER)) {
+            /* Capture the ids BEFORE entering the user namespace. Inside it,
+               and before any mapping exists, getuid() reports the overflow uid
+               (65534) -- writing that into uid_map asks to map a uid this
+               process does not own in the parent namespace, which is EPERM.
+               The mapping has to name the uid we had on the way in. */
+            uid_t outer_uid = getuid();
+            gid_t outer_gid = getgid();
             if (unshare(CLONE_NEWUSER) == 0 && unshare(flags) == 0) {
                 /* Map this uid/gid into the new namespace so the handler runs
-                   as a real user rather than nobody. Best effort: a handler
-                   that does not care about its own uid works either way, and
-                   setgroups must be denied before gid_map may be written. */
-                uid_t u = getuid(); gid_t g = getgid();
-                char m[64]; int fd;
+                   as itself rather than as nobody.
+                   The mapping must be the IDENTITY one. A process may only map
+                   uids it already owns in the parent namespace, so the
+                   tempting "0 <uid> 1" -- map me to root inside -- is EPERM
+                   whenever the actor is not privileged, including inside a
+                   rootless container where it is already in a user namespace.
+                   setgroups must be denied before gid_map may be written.
+                   Failure is not fatal: the namespaces are already in place and
+                   confining, and a handler that does not care about its own uid
+                   runs correctly as nobody. It IS reported, because an
+                   unmapped handler cannot mount /proc and that is otherwise
+                   diagnosed far from here. */
+                uid_t u = outer_uid; gid_t g = outer_gid;
+                char m[64]; int fd; int mapped = 1;
                 if ((fd = open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC)) >= 0) {
-                    ssize_t w = write(fd, "deny", 4); (void)w; close(fd);
+                    if (write(fd, "deny", 4) < 0) mapped = 0;
+                    close(fd);
                 }
                 int n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)u, (unsigned)u);
                 if ((fd = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC)) >= 0) {
-                    ssize_t w = write(fd, m, (size_t)n); (void)w; close(fd);
-                }
+                    if (write(fd, m, (size_t)n) < 0) mapped = 0;
+                    close(fd);
+                } else mapped = 0;
                 n = snprintf(m, sizeof(m), "%u %u 1", (unsigned)g, (unsigned)g);
                 if ((fd = open("/proc/self/gid_map", O_WRONLY | O_CLOEXEC)) >= 0) {
-                    ssize_t w = write(fd, m, (size_t)n); (void)w; close(fd);
+                    if (write(fd, m, (size_t)n) < 0) mapped = 0;
+                    close(fd);
+                } else mapped = 0;
+                if (!mapped || geteuid() != u) {
+                    fprintf(stderr, "[actor] isolation: handler runs as uid %u in its user "
+                                    "namespace (identity map unavailable); namespaces are "
+                                    "active but privileged operations inside them, such as "
+                                    "mounting /proc, will fail\n", (unsigned)geteuid());
                 }
                 goto unshared;
             }
@@ -335,9 +442,20 @@ unshared:;
            when one was also asked for. Without it the process tree is still
            confined; only the /proc view is stale. */
         if (flags & CLONE_NEWNS) {
-            if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
-                mount("proc", "/proc", "proc", 0, NULL) != 0) {
-                fprintf(stderr, "[actor] isolation: remount /proc: %s\n", strerror(errno));
+            /* Detach this namespace's mounts from the host's before touching
+               anything, or the changes below propagate back out. */
+            if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+                fprintf(stderr, "[actor] isolation: mount(/, MS_PRIVATE): %s\n",
+                        strerror(errno));
+                _exit(1);
+            }
+            /* pivot_root first, so the /proc mounted below lands inside the
+               new root rather than in a filesystem about to be detached. */
+            const char* rootfs = getenv("ACTOR_ROOTFS");
+            if (rootfs && *rootfs && do_pivot_root(rootfs) != 0) _exit(1);
+
+            if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+                fprintf(stderr, "[actor] isolation: mount(/proc): %s\n", strerror(errno));
                 _exit(1);
             }
         }
