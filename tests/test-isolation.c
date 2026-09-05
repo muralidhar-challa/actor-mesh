@@ -479,6 +479,88 @@ static void t_landlock_bad_port_fails(void) {
     stop(pp, -1);
 }
 
+
+/* ── 6. cgroup v2 ────────────────────────────────────────────────────────── */
+
+/* Find a cgroup this test can create a child in. Systemd delegates the user's
+   own slice, so that is the reliable place; if it is not available (no
+   systemd, cgroup v1, a locked-down CI container) the cases skip rather than
+   fail, because they would be testing the environment rather than the code. */
+static int make_test_cgroup(char *out, size_t cap) {
+    char base[512];
+    snprintf(base, sizeof(base),
+             "/sys/fs/cgroup/user.slice/user-%u.slice/user@%u.service",
+             (unsigned)getuid(), (unsigned)getuid());
+    if (access(base, W_OK) != 0) return 0;
+    snprintf(out, cap, "%s/actor-iso-test.scope", base);
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", out);
+    if (system(cmd) != 0) return 0;
+    return access(out, W_OK) == 0;
+}
+
+static void rm_test_cgroup(const char *path) {
+    char cmd[1024];
+    /* rmdir only: a cgroup directory cannot be removed while it has members,
+       and the actor is already gone by the time this runs. */
+    snprintf(cmd, sizeof(cmd), "rmdir '%s' 2>/dev/null", path);
+    system(cmd);
+}
+
+/* The actor joins the cgroup it was given, and says so. Membership is checked
+   from the outside -- reading the cgroup's own cgroup.procs -- rather than
+   trusting the actor's log line. */
+static void t_cgroup_join(void) {
+    TEST("cgroup: actor joins the cgroup it is given");
+    cleanup();
+    char cg[640];
+    if (!make_test_cgroup(cg, sizeof(cg))) {
+        printf("  SKIP: no writable cgroup v2 delegation available\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso14; mkdir -p /tmp/iso14");
+    char cgenv[768];
+    snprintf(cgenv, sizeof(cgenv), "ACTOR_CGROUP_PATH=%s", cg);
+    char *extra[] = { cgenv };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso14", extra, 1);
+    ms(900);
+
+    /* Is the actor's pid actually in that cgroup? */
+    char procs[768], cmd[1024];
+    snprintf(procs, sizeof(procs), "%s/cgroup.procs", cg);
+    snprintf(cmd, sizeof(cmd), "grep -qx '%d' '%s' 2>/dev/null && echo yes", (int)ap, procs);
+    FILE *f = popen(cmd, "r");
+    char ans[16] = {0};
+    if (f) { if (fgets(ans, sizeof(ans), f) == NULL) ans[0] = '\0'; pclose(f); }
+    CHECK(strncmp(ans, "yes", 3) == 0, "actor pid is not a member of the target cgroup");
+
+    /* And it still works. */
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1500, NULL, 0);
+    nng_close(s);
+    CHECK(got > 0, "actor in a cgroup did not serve a tuple");
+    stop(pp, ap);
+    rm_test_cgroup(cg);
+}
+
+/* The runtime joins and never creates. A path that does not exist is a
+   configuration error -- creating it would mean deciding ownership,
+   controllers and cleanup, which belong to whatever launches the actor. */
+static void t_cgroup_missing_fails(void) {
+    TEST("cgroup: a nonexistent cgroup fails closed (never created)");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso15; mkdir -p /tmp/iso15");
+    char *extra[] = { (char *)"ACTOR_CGROUP_PATH=/sys/fs/cgroup/actor-iso-nope" };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso15", extra, 1);
+    CHECK(exited(ap), "actor kept running with a cgroup path that does not exist");
+    CHECK(access("/sys/fs/cgroup/actor-iso-nope", F_OK) != 0,
+          "runtime created a cgroup; it must only ever join one");
+    stop(pp, -1);
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -494,6 +576,8 @@ int main(void) {
     t_landlock_lmdb_outside_fails();
     t_landlock_missing_path_fails();
     t_landlock_bad_port_fails();
+    t_cgroup_join();
+    t_cgroup_missing_fails();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();
