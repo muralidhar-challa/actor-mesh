@@ -364,14 +364,39 @@ static void t_nproc_below_usage_fails(void) {
 
 /* ── 5. Landlock ─────────────────────────────────────────────────────────── */
 
-/* The read set the exec path actually needs. The runtime runs handlers via
-   execl("/bin/sh", "sh", "-c", ...), so the shell, the dynamic loader and
-   every library both it and the actor pull in must be readable. On a distro
-   build that is /usr and /lib64 (ldd bin/actor: libnng, liblmdb, libc, the
-   mbedtls trio, ld-linux; ldd /bin/sh adds libtinfo). /bin and /lib are
-   included because they are symlinks into /usr on a merged-usr system and
-   resolving them costs nothing here. */
-#define LL_EXEC_RO "/usr:/lib64:/lib:/bin"
+/* The read set the exec path actually needs.
+ *
+ * The runtime execs handlers via execl("/bin/sh", "sh", "-c", ...), so the
+ * shell, the dynamic loader and every library both it and the actor pull in
+ * must be readable. The exact directories differ by distribution, and a
+ * ruleset naming one that does not exist fails closed by design -- so build
+ * the list from what is actually present rather than hardcoding a layout:
+ *
+ *   glibc/Fedora: /usr, /lib64 (/lib and /bin are symlinks into /usr)
+ *   musl/Alpine:  /usr, /lib   (the loader is /lib/ld-musl-*.so.1; no /lib64)
+ *
+ * This mirrors what an operator has to do for a real deployment, which is why
+ * it is spelled out rather than hidden in a constant. */
+static const char *ll_exec_ro(void) {
+    static char set[512];
+    if (set[0]) return set;
+    const char *cands[] = { "/usr", "/lib", "/lib64", "/bin", "/sbin", NULL };
+    set[0] = '\0';
+    for (int i = 0; cands[i]; i++) {
+        if (access(cands[i], F_OK) != 0) continue;   /* absent here */
+        if (set[0]) strncat(set, ":", sizeof(set) - strlen(set) - 1);
+        strncat(set, cands[i], sizeof(set) - strlen(set) - 1);
+    }
+    return set;
+}
+
+/* Build "ACTOR_LANDLOCK_RO=<paths>" into a caller-supplied buffer. */
+static char *ll_ro_env(char *buf, size_t cap) {
+    /* %.400s: the path list cannot outgrow the caller's buffer once the
+       "ACTOR_LANDLOCK_RO=" prefix is accounted for. */
+    snprintf(buf, cap, "ACTOR_LANDLOCK_RO=%.400s", ll_exec_ro());
+    return buf;
+}
 
 /* Landlock applied, and the handler can still do its job: read what is in the
    ro set, write what is in the rw set, and produce a result. If the read set
@@ -382,10 +407,8 @@ static void t_landlock_allows_handler(void) {
     cleanup();
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso9; mkdir -p /tmp/iso9");
-    char *extra[] = {
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso9",
-    };
+    char roenv[512]; ll_ro_env(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso9" };
     pid_t ap = start_actor("sh -c 'echo hi > /tmp/iso9/w.txt; echo done; cat /tmp/iso9/w.txt'",
                            "/tmp/iso9", extra, 2);
     ms(900);
@@ -410,10 +433,8 @@ static void t_landlock_denies_outside(void) {
     system("rm -rf /tmp/isosecret; mkdir -p /tmp/isosecret; echo SECRET > /tmp/isosecret/f");
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso10; mkdir -p /tmp/iso10");
-    char *extra[] = {
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso10",
-    };
+    char roenv[512]; ll_ro_env(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso10" };
     /* /tmp/isosecret is in neither set. */
     pid_t ap = start_actor("sh -c 'echo done; cat /tmp/isosecret/f 2>/dev/null || echo DENIED'",
                            "/tmp/iso10", extra, 2);
@@ -438,10 +459,8 @@ static void t_landlock_lmdb_outside_fails(void) {
     cleanup();
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso11 /tmp/iso11db; mkdir -p /tmp/iso11 /tmp/iso11db");
-    char *extra[] = {
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso11",
-    };
+    char roenv[512]; ll_ro_env(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso11" };
     /* LMDB lives somewhere the rw set does not cover. */
     pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso11db", extra, 2);
     CHECK(exited(ap), "actor kept running with its LMDB outside the landlock rw set");
@@ -456,10 +475,11 @@ static void t_landlock_missing_path_fails(void) {
     cleanup();
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso12; mkdir -p /tmp/iso12");
-    char *extra[] = {
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO ":/nonexistent/path/xyz",
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso12",
-    };
+    char roenv[600];
+    int rn = snprintf(roenv, sizeof(roenv),
+                     "ACTOR_LANDLOCK_RO=%.480s:/nonexistent/path/xyz", ll_exec_ro());
+    (void)rn;
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso12" };
     pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso12", extra, 2);
     CHECK(exited(ap), "actor kept running with an unresolvable landlock path");
     stop(pp, -1);
@@ -471,11 +491,9 @@ static void t_landlock_bad_port_fails(void) {
     cleanup();
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso13; mkdir -p /tmp/iso13");
-    char *extra[] = {
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso13",
-        (char *)"ACTOR_LANDLOCK_NET_CONNECT=99999",
-    };
+    char roenv[512]; ll_ro_env(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso13",
+                      (char *)"ACTOR_LANDLOCK_NET_CONNECT=99999" };
     pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso13", extra, 3);
     CHECK(exited(ap), "actor kept running with an out-of-range landlock port");
     stop(pp, -1);
@@ -636,11 +654,9 @@ static void t_pidns_no_survivors(void) {
     }
     pid_t pp = start_proxy();
     system("rm -rf /tmp/iso17; mkdir -p /tmp/iso17");
-    char *extra[] = {
-        (char *)"ACTOR_TUPLE_UNSHARE=pid",
-        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso17",
-        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
-    };
+    char roenv[512]; ll_ro_env(roenv, sizeof(roenv));
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid",
+                      (char *)"ACTOR_LANDLOCK_RW=/tmp/iso17", roenv };
     /* The background child sleeps past the handler's exit, then leaves a mark. */
     pid_t ap = start_actor(
         "sh -c '(sleep 2; echo SURVIVED > /tmp/iso17/mark) & echo done; echo started'",
@@ -761,6 +777,164 @@ static void t_tuple_absent_unchanged(void) {
     stop(pp, ap);
 }
 
+
+/* ── 8. per-tuple net, ipc, uts ──────────────────────────────────────────── */
+
+/* Can this host create the namespace at all? Same shape as pidns_available:
+   unprivileged unshare needs CAP_SYS_ADMIN or a user namespace to borrow it
+   from, and where neither exists the case is testing the host rather than the
+   code. */
+static int ns_available(int flag) {
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) {
+        if (unshare(flag) == 0) _exit(0);
+        if (unshare(CLONE_NEWUSER) == 0 && unshare(flag) == 0) _exit(0);
+        _exit(1);
+    }
+    int st = 1;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* net is the consequential one: a handler in a fresh network namespace has
+   only loopback, so it cannot reach anything -- correct for a local tool
+   handler, wrong for one that calls out. Two things are asserted: the handler
+   really is cut off, and the ACTOR's own bus connection is NOT disturbed,
+   since the namespace is created in the child after the fork. That second
+   half is why the result arrives at all. */
+static void t_netns_isolates_handler(void) {
+    TEST("net ns: handler sees only loopback, actor's bus is unaffected");
+    cleanup();
+    if (!ns_available(CLONE_NEWNET)) {
+        printf("  SKIP: no unprivileged network namespace on this host\n");
+        return;
+    }
+
+    /* How many interfaces does an unconfined process see here? */
+    int host_ifaces = 0;
+    {
+        FILE *f = popen("ip -o link show 2>/dev/null | wc -l", "r");
+        if (f) { if (fscanf(f, "%d", &host_ifaces) != 1) host_ifaces = 0; pclose(f); }
+    }
+    if (host_ifaces < 2) {
+        printf("  SKIP: host shows %d interfaces; need >1 to tell them apart\n", host_ifaces);
+        return;
+    }
+
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso22; mkdir -p /tmp/iso22");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=net" };
+    pid_t ap = start_actor("sh -c 'echo done; ip -o link show 2>/dev/null | wc -l'",
+                           "/tmp/iso22", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+
+    /* The result arriving at all proves the actor's own bus survived. */
+    CHECK(got > 0, "actor's bus connection was disturbed by the handler's net namespace");
+    printf("  host sees %d interfaces, handler sees %d\n", host_ifaces, atoi(buf));
+    CHECK(atoi(buf) < host_ifaces, "handler was not network-isolated");
+    stop(pp, ap);
+}
+
+/* uts: the handler gets its own hostname namespace. Setting a hostname needs
+   CAP_SYS_ADMIN, which an unprivileged handler does not have, so what is
+   asserted is the durable half -- whatever the handler does, the HOST's
+   hostname is unchanged. */
+static void t_utsns_host_unchanged(void) {
+    TEST("uts ns: a handler cannot change the host's hostname");
+    cleanup();
+    if (!ns_available(CLONE_NEWUTS)) {
+        printf("  SKIP: no unprivileged uts namespace on this host\n");
+        return;
+    }
+    char before[256] = {0};
+    if (gethostname(before, sizeof(before) - 1) != 0) {
+        printf("  SKIP: cannot read hostname\n");
+        return;
+    }
+
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso23; mkdir -p /tmp/iso23");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=uts" };
+    pid_t ap = start_actor("sh -c 'echo done; hostname actor-iso-probe 2>/dev/null; hostname'",
+                           "/tmp/iso23", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[256] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "handler did not run under a uts namespace");
+
+    char after[256] = {0};
+    gethostname(after, sizeof(after) - 1);
+    CHECK(strcmp(before, after) == 0, "the host's hostname was changed by a handler");
+    printf("  host hostname before=%s after=%s\n", before, after);
+    stop(pp, ap);
+}
+
+/* ipc: the handler gets a fresh System V IPC namespace, so it cannot see
+   segments created outside it. Asserted via /proc/sysvipc, which reflects the
+   caller's namespace. */
+static void t_ipcns_separate(void) {
+    TEST("ipc ns: handler does not share the host's IPC namespace");
+    cleanup();
+    if (!ns_available(CLONE_NEWIPC)) {
+        printf("  SKIP: no unprivileged ipc namespace on this host\n");
+        return;
+    }
+    char host_ns[128] = {0};
+    ssize_t n = readlink("/proc/self/ns/ipc", host_ns, sizeof(host_ns) - 1);
+    if (n <= 0) { printf("  SKIP: cannot read /proc/self/ns/ipc\n"); return; }
+    host_ns[n] = '\0';
+
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso24; mkdir -p /tmp/iso24");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=ipc" };
+    pid_t ap = start_actor("sh -c 'echo done; readlink /proc/self/ns/ipc'",
+                           "/tmp/iso24", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "handler did not run under an ipc namespace");
+    buf[strcspn(buf, "\r\n")] = '\0';
+    printf("  host ipc=%s handler ipc=%s\n", host_ns, buf);
+    CHECK(strcmp(host_ns, buf) != 0, "handler shared the host's ipc namespace");
+    stop(pp, ap);
+}
+
+/* Several namespaces at once, which is the realistic configuration, and the
+   combination must still leave a working handler. */
+static void t_multi_ns(void) {
+    TEST("pid,ipc,uts,net together: handler still runs and is isolated");
+    cleanup();
+    if (!pidns_available() || !ns_available(CLONE_NEWNET)) {
+        printf("  SKIP: this host cannot create the full namespace set\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso25; mkdir -p /tmp/iso25");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid,ipc,uts,net" };
+    pid_t ap = start_actor("sh -c 'echo done; echo $$'", "/tmp/iso25", extra, 1);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[128] = {0};
+    int got = drain(s, 2500, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "handler did not run with the full namespace set");
+    CHECK(atoi(buf) == 1, "handler was not pid 1 with several namespaces combined");
+    stop(pp, ap);
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -784,6 +958,10 @@ int main(void) {
     t_pidns_concurrent();
     t_pidns_failure_still_fails();
     t_tuple_unknown_ns_fails();
+    t_netns_isolates_handler();
+    t_utsns_host_unchanged();
+    t_ipcns_separate();
+    t_multi_ns();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();

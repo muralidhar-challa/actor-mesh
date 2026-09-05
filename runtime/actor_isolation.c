@@ -20,7 +20,53 @@
 #include <sys/types.h>
 #include <grp.h>
 #include <fcntl.h>
-#include <linux/landlock.h>
+/* linux/landlock.h comes from linux-headers, which is not installed in every
+   base image the runtime is built in -- notably alpine, which Dockerfile.actor
+   uses, where its absence is a build failure rather than a missing feature.
+   The Landlock UAPI is a stable kernel ABI, so declare what is needed when the
+   header is not present. Availability is decided at RUNTIME by asking the
+   kernel for its ABI version, never at compile time. */
+#if defined(__has_include)
+#  if __has_include(<linux/landlock.h>)
+#    include <linux/landlock.h>
+#    define ACTOR_HAVE_LANDLOCK_H 1
+#  endif
+#endif
+
+#ifndef ACTOR_HAVE_LANDLOCK_H
+struct landlock_ruleset_attr {
+    uint64_t handled_access_fs;
+    uint64_t handled_access_net;
+};
+struct landlock_path_beneath_attr {
+    uint64_t allowed_access;
+    int32_t  parent_fd;
+} __attribute__((packed));
+struct landlock_net_port_attr {
+    uint64_t allowed_access;
+    uint64_t port;
+};
+enum landlock_rule_type {
+    LANDLOCK_RULE_PATH_BENEATH = 1,
+    LANDLOCK_RULE_NET_PORT     = 2,
+};
+#define LANDLOCK_CREATE_RULESET_VERSION   (1U << 0)
+#define LANDLOCK_ACCESS_FS_EXECUTE        (1ULL << 0)
+#define LANDLOCK_ACCESS_FS_WRITE_FILE     (1ULL << 1)
+#define LANDLOCK_ACCESS_FS_READ_FILE      (1ULL << 2)
+#define LANDLOCK_ACCESS_FS_READ_DIR       (1ULL << 3)
+#define LANDLOCK_ACCESS_FS_REMOVE_DIR     (1ULL << 4)
+#define LANDLOCK_ACCESS_FS_REMOVE_FILE    (1ULL << 5)
+#define LANDLOCK_ACCESS_FS_MAKE_CHAR      (1ULL << 6)
+#define LANDLOCK_ACCESS_FS_MAKE_DIR       (1ULL << 7)
+#define LANDLOCK_ACCESS_FS_MAKE_REG       (1ULL << 8)
+#define LANDLOCK_ACCESS_FS_MAKE_SOCK      (1ULL << 9)
+#define LANDLOCK_ACCESS_FS_MAKE_FIFO      (1ULL << 10)
+#define LANDLOCK_ACCESS_FS_MAKE_BLOCK     (1ULL << 11)
+#define LANDLOCK_ACCESS_FS_MAKE_SYM       (1ULL << 12)
+#define LANDLOCK_ACCESS_NET_BIND_TCP      (1ULL << 0)
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP   (1ULL << 1)
+#endif /* !ACTOR_HAVE_LANDLOCK_H */
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sched.h>
@@ -418,15 +464,27 @@ static int join_cgroup(void) {
 #  define LANDLOCK_ACCESS_FS_IOCTL_DEV (1ULL << 15)
 #endif
 
+/* Syscall numbers, in case the libc headers predate them. These are fixed
+   per architecture and identical across every arch this runtime targets. */
+#ifndef __NR_landlock_create_ruleset
+#  define __NR_landlock_create_ruleset 444
+#endif
+#ifndef __NR_landlock_add_rule
+#  define __NR_landlock_add_rule 445
+#endif
+#ifndef __NR_landlock_restrict_self
+#  define __NR_landlock_restrict_self 446
+#endif
+
 static long ll_create_ruleset(const struct landlock_ruleset_attr* attr,
-                              size_t size, __u32 flags) {
+                              size_t size, uint32_t flags) {
     return syscall(__NR_landlock_create_ruleset, attr, size, flags);
 }
 static long ll_add_rule(int fd, enum landlock_rule_type t,
-                        const void* attr, __u32 flags) {
+                        const void* attr, uint32_t flags) {
     return syscall(__NR_landlock_add_rule, fd, t, attr, flags);
 }
-static long ll_restrict_self(int fd, __u32 flags) {
+static long ll_restrict_self(int fd, uint32_t flags) {
     return syscall(__NR_landlock_restrict_self, fd, flags);
 }
 
