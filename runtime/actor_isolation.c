@@ -156,6 +156,79 @@ static int drop_privilege(void) {
 }
 
 
+
+/* ── cgroup v2 ───────────────────────────────────────────────────────────────
+ *
+ * Join an existing cgroup by writing this pid into its cgroup.procs.
+ *
+ * The runtime joins and never creates. Creating a hierarchy means deciding
+ * where it lives, who owns it, what controllers it enables and who cleans it
+ * up -- all of which belong to whatever launches actors, which already knows
+ * those answers. An actor that had to create its own would also need write
+ * access to the parent cgroup directory, which is a larger privilege than
+ * anything else this module asks for.
+ *
+ * Note this joins the ACTOR, and every handler it forks inherits the
+ * membership. Per-tuple accounting is not possible this way and is not
+ * attempted.
+ */
+static int join_cgroup(void) {
+    const char* path = getenv("ACTOR_CGROUP_PATH");
+    if (!path) return 0;
+
+    char procs[PATH_MAX];
+    int n = snprintf(procs, sizeof(procs), "%s/cgroup.procs", path);
+    if (n < 0 || (size_t)n >= sizeof(procs)) {
+        fprintf(stderr, "[actor] isolation: ACTOR_CGROUP_PATH too long\n");
+        return -1;
+    }
+
+    FILE* f = fopen(procs, "w");
+    if (!f) {
+        fprintf(stderr, "[actor] isolation: cgroup \"%s\": %s "
+                        "(the cgroup must already exist and be writable; "
+                        "the runtime never creates one)\n", procs, strerror(errno));
+        return -1;
+    }
+    if (fprintf(f, "%d\n", (int)getpid()) < 0 || fclose(f) != 0) {
+        fprintf(stderr, "[actor] isolation: writing pid to \"%s\": %s\n",
+                procs, strerror(errno));
+        return -1;
+    }
+
+    /* Verify membership rather than trust the write. A cgroup.procs write can
+       be accepted and still not place the process where it was asked -- for
+       instance when the target has domain-controller constraints -- and an
+       actor that believes it is accounted for when it is not is exactly the
+       silent degradation this module refuses. */
+    FILE* sf = fopen("/proc/self/cgroup", "r");
+    if (!sf) {
+        fprintf(stderr, "[actor] isolation: cannot read /proc/self/cgroup to verify\n");
+        return -1;
+    }
+    char line[PATH_MAX + 64];
+    int joined = 0;
+    /* Unified hierarchy lines look like "0::/path/relative/to/mount". */
+    while (fgets(line, sizeof(line), sf)) {
+        char* rel = strstr(line, "0::");
+        if (!rel) continue;
+        rel += 3;
+        line[strcspn(line, "\n")] = '\0';
+        size_t rl = strlen(rel);
+        if (rl && rl <= strlen(path) && strcmp(path + strlen(path) - rl, rel) == 0) joined = 1;
+        break;
+    }
+    fclose(sf);
+    if (!joined) {
+        fprintf(stderr, "[actor] isolation: cgroup write to \"%s\" was accepted but "
+                        "the process is not a member\n", path);
+        return -1;
+    }
+
+    fprintf(stderr, "[actor] isolation: cgroup=%s\n", path);
+    return 0;
+}
+
 /* ── Landlock ────────────────────────────────────────────────────────────────
  *
  * Path-based confinement: after landlock_restrict_self the process may only
@@ -434,7 +507,7 @@ int actor_isolation_apply(void) {
         getenv("ACTOR_RLIMIT_AS")     || getenv("ACTOR_RLIMIT_CPU")  ||
         getenv("ACTOR_RLIMIT_NOFILE") || getenv("ACTOR_RLIMIT_NPROC")  ||
         getenv("ACTOR_LANDLOCK_RO")   || getenv("ACTOR_LANDLOCK_RW")   ||
-        getenv("ACTOR_LANDLOCK_NET_CONNECT");
+        getenv("ACTOR_LANDLOCK_NET_CONNECT") || getenv("ACTOR_CGROUP_PATH");
     if (!requested) return 0;
 
     if (looks_multithreaded()) {
@@ -469,6 +542,10 @@ int actor_isolation_apply(void) {
     if (apply_rlimit("ACTOR_RLIMIT_NPROC",  RLIMIT_NPROC,  "RLIMIT_NPROC")  < 0) return -1;
 
     if (drop_privilege() < 0) return -1;
+
+    /* cgroup before Landlock: joining needs to open a path under
+       /sys/fs/cgroup, which an operator has no reason to put in the ruleset. */
+    if (join_cgroup() < 0) return -1;
 
     /* Landlock last: it is irreversible, and everything above still needs an
        unrestricted view of the filesystem to do its job. */
