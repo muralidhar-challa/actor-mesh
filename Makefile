@@ -38,16 +38,16 @@ ifneq ($(TARGET),native)
   CFLAGS  += -target $(TARGET)
 endif
 
-.PHONY: all actor mesh-proxy clean test-concurrency linux-arm64 macos-x64 macos-arm64 windows-x64
+.PHONY: all actor mesh-proxy clean test-concurrency test-isolation linux-arm64 macos-x64 macos-arm64 windows-x64
 
 all: actor mesh-proxy
 
 bin/:
 	mkdir -p bin
 
-actor: runtime/main.c runtime/actor.c runtime/actor.h \
-       runtime/actor_tuple.h runtime/actor_uuid.h | bin/
-	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c $(LIBS) -o bin/actor
+actor: runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/actor.h \
+       runtime/actor_tuple.h runtime/actor_uuid.h runtime/actor_isolation.h | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c runtime/actor_isolation.c $(LIBS) -o bin/actor
 
 mesh-proxy: proxy/proxy.c | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o bin/mesh-proxy
@@ -57,6 +57,12 @@ mesh-proxy: proxy/proxy.c | bin/
 test-concurrency: actor mesh-proxy tests/test-concurrency.c | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-concurrency.c -lnng -o bin/test-concurrency
 	./bin/test-concurrency
+
+# Isolation tests. Needs actor + mesh-proxy built first; run from the repo
+# root so ./bin/... resolves.
+test-isolation: actor mesh-proxy tests/test-isolation.c | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-isolation.c -lnng -o bin/test-isolation
+	./bin/test-isolation
 
 clean:
 	rm -rf bin/
