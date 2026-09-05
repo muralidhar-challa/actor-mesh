@@ -37,6 +37,9 @@ bash test-mcp-mesh.sh "how many employees?"
 gcc -Wall -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
 bin/test-mesh           # 10/10 unit tests
 
+make test-concurrency   # ACTOR_CONCURRENCY + child reaping
+make test-isolation     # ACTOR_* confinement (Linux; skips what the host lacks)
+
 gcc -Wall -O2 -std=c11 tests/test-employee.c -lnng -o bin/test-employee
 bin/test-employee        # 9/9 integration (needs Ollama or API key)
 ```
