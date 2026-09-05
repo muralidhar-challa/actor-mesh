@@ -359,6 +359,126 @@ static void t_nproc_below_usage_fails(void) {
     stop(pp, ap);
 }
 
+
+/* ── 5. Landlock ─────────────────────────────────────────────────────────── */
+
+/* The read set the exec path actually needs. The runtime runs handlers via
+   execl("/bin/sh", "sh", "-c", ...), so the shell, the dynamic loader and
+   every library both it and the actor pull in must be readable. On a distro
+   build that is /usr and /lib64 (ldd bin/actor: libnng, liblmdb, libc, the
+   mbedtls trio, ld-linux; ldd /bin/sh adds libtinfo). /bin and /lib are
+   included because they are symlinks into /usr on a merged-usr system and
+   resolving them costs nothing here. */
+#define LL_EXEC_RO "/usr:/lib64:/lib:/bin"
+
+/* Landlock applied, and the handler can still do its job: read what is in the
+   ro set, write what is in the rw set, and produce a result. If the read set
+   is wrong the handler cannot even start, so this passing is what proves the
+   enumeration above is complete. */
+static void t_landlock_allows_handler(void) {
+    TEST("landlock: handler runs and can write inside the rw set");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso9; mkdir -p /tmp/iso9");
+    char *extra[] = {
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso9",
+    };
+    pid_t ap = start_actor("sh -c 'echo hi > /tmp/iso9/w.txt; echo done; cat /tmp/iso9/w.txt'",
+                           "/tmp/iso9", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[256] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "handler did not run under landlock (read set likely incomplete)");
+    CHECK(strncmp(buf, "hi", 2) == 0, "handler could not write inside ACTOR_LANDLOCK_RW");
+    stop(pp, ap);
+}
+
+/* The negative case, and the one that matters: a path outside the ruleset is
+   not readable. The handler reports the exit status of reading a file that
+   exists and is readable without landlock, so a non-zero status here is the
+   restriction working rather than a missing file. */
+static void t_landlock_denies_outside(void) {
+    TEST("landlock: a path outside the ruleset is denied");
+    cleanup();
+    /* A file that certainly exists and is readable, outside any granted path. */
+    system("rm -rf /tmp/isosecret; mkdir -p /tmp/isosecret; echo SECRET > /tmp/isosecret/f");
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso10; mkdir -p /tmp/iso10");
+    char *extra[] = {
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso10",
+    };
+    /* /tmp/isosecret is in neither set. */
+    pid_t ap = start_actor("sh -c 'echo done; cat /tmp/isosecret/f 2>/dev/null || echo DENIED'",
+                           "/tmp/iso10", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[256] = {0};
+    int got = drain(s, 2000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "no result");
+    CHECK(strstr(buf, "DENIED") != NULL, "handler read a file outside the landlock ruleset");
+    CHECK(strstr(buf, "SECRET") == NULL, "handler saw content it should not have");
+    if (got > 0) printf("  handler reported: %.32s\n", buf);
+    stop(pp, ap);
+}
+
+/* ACTOR_LMDB_PATH outside the rw set means the actor cannot open its own
+   database. That must be a clear configuration error before the ruleset is
+   enforced, not an opaque LMDB failure after. */
+static void t_landlock_lmdb_outside_fails(void) {
+    TEST("landlock: ACTOR_LMDB_PATH outside the rw set fails closed");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso11 /tmp/iso11db; mkdir -p /tmp/iso11 /tmp/iso11db");
+    char *extra[] = {
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso11",
+    };
+    /* LMDB lives somewhere the rw set does not cover. */
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso11db", extra, 2);
+    CHECK(exited(ap), "actor kept running with its LMDB outside the landlock rw set");
+    stop(pp, -1);
+}
+
+/* A path that does not exist cannot be granted. Skipping it silently would
+   confine the actor more than the operator asked for, in a way they would not
+   discover until a handler failed. */
+static void t_landlock_missing_path_fails(void) {
+    TEST("landlock: a nonexistent path in the ruleset fails closed");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso12; mkdir -p /tmp/iso12");
+    char *extra[] = {
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO ":/nonexistent/path/xyz",
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso12",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso12", extra, 2);
+    CHECK(exited(ap), "actor kept running with an unresolvable landlock path");
+    stop(pp, -1);
+}
+
+/* A malformed port is a configuration error, not something to skip. */
+static void t_landlock_bad_port_fails(void) {
+    TEST("landlock: a bad ACTOR_LANDLOCK_NET_CONNECT port fails closed");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso13; mkdir -p /tmp/iso13");
+    char *extra[] = {
+        (char *)"ACTOR_LANDLOCK_RO=" LL_EXEC_RO,
+        (char *)"ACTOR_LANDLOCK_RW=/tmp/iso13",
+        (char *)"ACTOR_LANDLOCK_NET_CONNECT=99999",
+    };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso13", extra, 3);
+    CHECK(exited(ap), "actor kept running with an out-of-range landlock port");
+    stop(pp, -1);
+}
+
 int main(void) {
     printf("actor isolation tests (phase 1)\n\n");
     t_absent();
@@ -369,6 +489,11 @@ int main(void) {
     t_failing_handler_still_fails();
     t_nproc_ordering();
     t_nproc_below_usage_fails();
+    t_landlock_allows_handler();
+    t_landlock_denies_outside();
+    t_landlock_lmdb_outside_fails();
+    t_landlock_missing_path_fails();
+    t_landlock_bad_port_fails();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
     cleanup();
