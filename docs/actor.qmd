@@ -16,7 +16,55 @@ An actor is a long-running process configured entirely by environment variables.
   <div class="env-row"><div class="env-key">ACTOR_TTL_NS</div><div class="env-val">Default tuple TTL in nanoseconds. 0 = no expiry.</div></div>
   <div class="env-row"><div class="env-key">ACTOR_HEARTBEAT_MS</div><div class="env-val">Heartbeat emission interval in milliseconds. Default 5000.</div></div>
   <div class="env-row"><div class="env-key">ACTOR_RETRY_MAX</div><div class="env-val">Max handler retries on non-zero exit. Default 3.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_CONCURRENCY</div><div class="env-val">Messages in flight at once. Default 1, max 32.</div></div>
 </div>
+```
+
+## Isolation
+
+Optional, opt-in, Linux only. An actor with none of these set behaves exactly as
+it did before they existed.
+
+```{=html}
+<div class="env-table">
+  <div class="env-row"><div class="env-key">ACTOR_UID / ACTOR_GID</div><div class="env-val">Drop to this uid/gid at startup, irreversibly.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_RLIMIT_AS / _CPU / _NOFILE / _NPROC</div><div class="env-val">Resource limits, applied before the privilege drop.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_CGROUP_PATH</div><div class="env-val">Existing cgroup v2 directory to join. Never created by the runtime.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_LANDLOCK_RO</div><div class="env-val">Colon-separated read-only paths. Must cover /bin/sh, the handler and its libraries.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_LANDLOCK_RW</div><div class="env-val">Colon-separated read/write paths. Must contain ACTOR_LMDB_PATH.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_LANDLOCK_NET_CONNECT</div><div class="env-val">Colon-separated outbound TCP ports. Needs Landlock ABI 4 (kernel 6.7+).</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_SECCOMP</div><div class="env-val">1, or permissive_mount when per-tuple namespaces are in use.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_TUPLE_UNSHARE</div><div class="env-val">Namespaces created per handler: pid, ipc, uts, net, mount.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_ROOTFS</div><div class="env-val">pivot_root target. Requires pid and mount in ACTOR_TUPLE_UNSHARE.</div></div>
+  <div class="env-row"><div class="env-key">ACTOR_TUPLE_USERNS</div><div class="env-val">Set to 0 to disable the user-namespace fallback for unprivileged unshare.</div></div>
+</div>
+```
+
+Isolation has two lifetimes. Everything except the last three is **actor-scoped**
+— applied once at startup, before the sockets and before any thread, defining
+what this actor may ever do. `ACTOR_TUPLE_UNSHARE` and `ACTOR_ROOTFS` are
+**tuple-scoped**: created in the forked child and destroyed when the handler
+exits.
+
+That second scope is the interesting one. A tuple is a self-contained unit of
+work, and the runtime already treats it that way for memory and process
+identity. A namespace per tuple extends it to the process tree: when the handler
+exits the kernel kills whatever is left inside, so a handler's stray children
+cannot outlive the tuple that created them.
+
+Every variable **fails closed**. One that is set but cannot be applied aborts
+startup rather than leaving the actor running less confined than configured.
+
+```{mermaid}
+stateDiagram-v2
+  [*] --> Config      : read environment
+  Config --> Isolate  : uid, rlimits, cgroup, Landlock, seccomp
+  Isolate --> Connect : NNG + LMDB
+  Connect --> Polling
+  Polling --> Forking : tuple received
+  Forking --> Unshare : fork
+  Unshare --> Exec    : per-tuple namespaces
+  Exec --> Polling    : handler exits, namespace destroyed
 ```
 
 ## Multi-topic subscription

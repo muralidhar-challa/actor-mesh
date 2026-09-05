@@ -156,23 +156,24 @@ int main(void) {
 
 ```
 1. Read config from environment
-2. Connect NNG pub0 + sub0 to proxy
-3. Open LMDB
-4. Enter poll loop:
+2. Apply isolation if configured — before sockets, LMDB, or any thread
+3. Connect NNG pub0 + sub0 to proxy
+4. Open LMDB
+5. Enter poll loop:
    a. Emit heartbeat every ACTOR_HEARTBEAT_MS
    b. NNG recvmsg (100ms timeout)
    c. Receive header + payload as single buffer
    d. Cast to actor_header_t (zero copy)
    e. Check TTL — drop if expired
    f. Write frame to LMDB inbox (durability)
-   g. Set header env vars, fork handler
+   g. Set header env vars, fork handler (+ per-tuple namespaces if configured)
    h. Write payload to handler stdin
    i. Read result into static buffer (capped at ACTOR_MAX_PAYLOAD)
    j. Build result header (carry correlation chain)
    k. Write result frame to LMDB outbox
    l. Publish result to NNG bus
    m. Clear LMDB inbox + outbox
-5. On SIGTERM — drain and exit
+6. On SIGTERM — drain and exit
 ```
 
 ---
@@ -216,6 +217,153 @@ make ACTOR_MAX_PAYLOAD=4194304
 
 Handlers follow the same discipline: static buffers only, no malloc/realloc.
 Data flows as pointers from stdin buffer to stdout — no heap involvement.
+
+---
+
+## Isolation
+
+Optional, opt-in, Linux only. An actor with none of these set behaves exactly
+as it did before they existed — that property is asserted by the test suite,
+not assumed.
+
+Two scopes, because isolation here has two lifetimes:
+
+**Actor-lifetime** — applied once at startup, before the poll loop and before
+any thread is created. Privilege drop, resource limits, cgroup membership,
+Landlock, seccomp. These define what this actor may ever do.
+
+**Tuple-lifetime** — applied per message, in the forked child, before `exec`.
+Namespaces, created and destroyed with one tuple.
+
+```
+1. Read config from environment
+2. Isolation: uid/gid, rlimits, cgroup, Landlock, seccomp   ← actor scope
+3. Connect NNG, open LMDB, start workers
+4. Poll loop:
+     fork → unshare namespaces → exec handler               ← tuple scope
+```
+
+### Why namespaces are per tuple
+
+A tuple is a self-contained unit of work. The runtime already holds that for
+memory (fixed buffers, no heap per tuple) and for process identity (a fresh
+fork per handler). The process *tree* was where it leaked: a handler's own
+children could outlive it, get reparented to the actor, and accumulate across
+tuples meant to be independent.
+
+A namespace created per tuple closes that. When the handler exits, the kernel
+kills whatever remains inside it — teardown is not something anyone has to
+remember. The tuple leaves no trace, which is what the model claimed in the
+first place.
+
+`unshare(CLONE_NEWPID)` does not move the caller into the new namespace; it
+makes the caller's *next* fork PID 1 of it, and the namespace dies when that
+PID 1 exits. So the runtime forks again after unsharing, and the grandchild —
+which is PID 1 — becomes the handler. Placed at startup instead, the first
+handler would be PID 1 and every later tuple would fork into a dead namespace.
+
+### Fail closed
+
+A variable that is set and cannot be honoured aborts startup. An actor that
+runs less confined than it believes it is, is worse than one that never tried:
+the deployment sees no error and assumes a boundary it does not have. A
+malformed value is an error too — reading `ACTOR_UID=root` as uid 0 is the
+worst available reading of a typo.
+
+### Practical notes
+
+- **`ACTOR_LMDB_PATH` must be inside `ACTOR_LANDLOCK_RW`.** The actor opens its
+  database after the ruleset is enforced. This is checked at startup so the
+  message names the real problem.
+- **`ACTOR_LANDLOCK_RO` must cover the whole exec path**: `/bin/sh`, the handler,
+  the dynamic loader and every library they need. On glibc that is `/usr` and
+  `/lib64`; on musl `/usr` and `/lib`. A missing entry produces a handler that
+  cannot start.
+- **`ACTOR_RLIMIT_NPROC` counts every process and thread for the real uid,
+  system-wide** — not the actor's descendants. Give an actor its own uid and
+  size the limit against `ps -L -u <uid> | wc -l`, or a value that looks
+  generous can already be below current usage and the actor dies on its first
+  `pthread_create`.
+- **Namespaces need privilege.** Unprivileged `unshare(CLONE_NEWPID)` is EPERM
+  on a stock host; the runtime retries behind a user namespace, which works
+  where unprivileged user namespaces are enabled. `ACTOR_TUPLE_USERNS=0` opts
+  out.
+- **`ACTOR_SECCOMP=1` and `ACTOR_TUPLE_UNSHARE` conflict** and are refused
+  together: the filter is inherited by the child, where the namespaces need
+  `unshare` and the mount family. Use `ACTOR_SECCOMP=permissive_mount`.
+
+### Observing what handlers actually call
+
+The seccomp denylist is a fixed set of calls no handler should need. It is not
+derived from your handlers, and it cannot be: the handler contract is "any
+process that speaks stdio", so the syscall set moves with the language, the
+libc, and the work. The list shipped here was validated by tracing the runtime
+plus shell handlers — 57 distinct calls — which is enough to justify a denylist
+and nowhere near enough to justify an allowlist.
+
+eBPF is the right tool for closing that gap. It belongs to the *node*, not to
+the actor: a privileged agent shipped in the node image, observing the
+unprivileged workloads around it. That is the usual shape and it keeps the
+privilege boundary intact — the actor still cannot see or influence the tracer,
+and the seccomp filter denies `bpf` so it cannot start one of its own. Same rule
+as cgroups: the runtime is observed and joins what it is given; it does not
+provision.
+
+If you build the node image, this is close to free. `ACTOR_CGROUP_PATH` already
+gives every actor a cgroup identity the kernel can filter on, so a single
+node-level agent attributes syscalls per actor with no change to the runtime and
+no per-actor configuration.
+
+What it buys:
+
+- **Keeping the denylist honest.** If a handler starts calling something the
+  list denies, you see it before it becomes a failed tuple in production.
+- **Narrowing toward an allowlist where it is safe.** For a *known, fixed* set
+  of handlers — one org's tools, say — the observed set over weeks is real
+  evidence, and an allowlist built from it is defensible in a way one built from
+  a hand-trace is not.
+- **Attributing a denial.** A tuple that failed under seccomp says only that the
+  handler exited non-zero. A trace says which syscall, in which handler, for
+  which correlation id.
+
+Off-the-shelf tooling is enough; nothing custom is required:
+
+```sh
+# What is every handler under this actor calling?
+sudo execsnoop-bpfcc                       # exec of each handler
+sudo syscount-bpfcc -p $(pgrep -f bin/actor) -L    # per-syscall counts
+
+# Or scope by cgroup, if actors join one (ACTOR_CGROUP_PATH)
+sudo bpftrace -e 'tracepoint:raw_syscalls:sys_enter
+                  /cgroup == cgroupid("/sys/fs/cgroup/actors/org-a")/
+                  { @[args.id] = count(); }'
+```
+
+The cgroup form is the useful one at scale: `ACTOR_CGROUP_PATH` already gives
+each actor a stable identity the kernel understands, so a trace can be scoped to
+one actor, one org, or the whole fleet without touching the runtime.
+
+This is deliberately not built into the runtime. Adding it would mean the actor
+loading kernel programs — the privilege the rest of this design spends its
+effort giving up, and the one thing a compromised handler would most want. As a
+separate privileged component on a node image you control, it is exactly the
+right place for it.
+
+### Example
+
+```sh
+ACTOR_ID=sqlite-tool-1 \
+ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result \
+ACTOR_HANDLER=/handlers/sqlite-tool \
+ACTOR_LMDB_PATH=/var/actor/db \
+ACTOR_UID=61000 ACTOR_GID=61000 \
+ACTOR_RLIMIT_AS=536870912 ACTOR_RLIMIT_NOFILE=256 \
+ACTOR_LANDLOCK_RO=/usr:/lib64 \
+ACTOR_LANDLOCK_RW=/var/actor/db \
+ACTOR_TUPLE_UNSHARE=pid,ipc,uts \
+ACTOR_SECCOMP=permissive_mount \
+./actor &
+```
 
 ---
 
@@ -263,6 +411,22 @@ Payload cap exceeded → drop immediately, no retry.
 | `ACTOR_TTL_NS` | ☐ | 0 | Default tuple TTL nanoseconds |
 | `ACTOR_HEARTBEAT_MS` | ☐ | 5000 | Heartbeat interval ms |
 | `ACTOR_RETRY_MAX` | ☐ | 3 | Max handler retries |
+| `ACTOR_CONCURRENCY` | ☐ | 1 | Messages in flight at once (max 32) |
+
+Isolation (Linux, all optional — see [Isolation](#isolation)):
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACTOR_UID` / `ACTOR_GID` | — | Drop to this uid/gid, irreversibly |
+| `ACTOR_RLIMIT_AS` / `_CPU` / `_NOFILE` / `_NPROC` | — | Resource limits |
+| `ACTOR_CGROUP_PATH` | — | Existing cgroup v2 directory to join |
+| `ACTOR_LANDLOCK_RO` | — | Colon-separated read-only paths |
+| `ACTOR_LANDLOCK_RW` | — | Colon-separated read/write paths |
+| `ACTOR_LANDLOCK_NET_CONNECT` | — | Colon-separated outbound TCP ports |
+| `ACTOR_SECCOMP` | — | `1`, or `permissive_mount` with namespaces |
+| `ACTOR_TUPLE_UNSHARE` | — | Per-handler namespaces: `pid,ipc,uts,net,mount` |
+| `ACTOR_ROOTFS` | — | `pivot_root` target; needs `pid,mount` |
+| `ACTOR_TUPLE_USERNS` | — | `0` disables the user-namespace fallback |
 
 Proxy:
 
