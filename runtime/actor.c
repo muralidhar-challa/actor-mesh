@@ -14,6 +14,9 @@
 #include "actor.h"
 #include "actor_tuple.h"
 #include "actor_uuid.h"
+#ifndef _WIN32
+#  include "actor_isolation.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -500,6 +503,12 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         setenv("ACTOR_TUPLE_ORIGIN",   env->origin,   1);
         setenv("ACTOR_ATTEMPT",        env->attempt,  1);
 
+        /* Per-tuple namespaces, before exec so they live and die with this one
+           tuple. A failure here must not become a handler that runs anyway:
+           _exit non-zero is already how this path reports a failed run, and
+           the retry/rejection logic upstream handles it unchanged. */
+        if (actor_isolation_tuple() != 0) _exit(1);
+
         dup2(to_child[0],   STDIN_FILENO);
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
@@ -821,6 +830,17 @@ static void* worker_main(void* arg) {
 
 int actor_run(void) {
     if (cfg_load() < 0) return -1;
+
+#ifndef _WIN32
+    /* Confinement goes here and nowhere else: after the config read, before
+       the sockets, the LMDB open and -- critically -- before any thread is
+       created. See actor_isolation.h for why that ordering is load bearing.
+       An actor that requested isolation it cannot have does not proceed. */
+    if (actor_isolation_apply() < 0) {
+        fprintf(stderr, "[actor] FATAL: isolation requested but not applied\n");
+        return -1;
+    }
+#endif
 
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);

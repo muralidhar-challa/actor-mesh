@@ -28,6 +28,10 @@ Three concepts:
 - **Actor** — fork/exec loop. Receives message, runs handler, publishes result. LMDB for durability.
 - **Handler** — any process. Reads payload from stdin, writes result to stdout, exits.
 
+Optionally, an actor can confine itself and each tuple it handles — uid, resource
+limits, cgroup, Landlock, seccomp, and per-handler namespaces — all opt-in through
+the environment. See [Isolation](DESIGN.md#isolation).
+
 ## Quick Start
 
 ```sh
@@ -82,8 +86,20 @@ ACTOR_BUS_PUB=tcp://127.0.0.1:5557 \
 ## Tests
 
 ```sh
-gcc -Wall -O2 tests/test-mesh.c -lnng -o bin/test-mesh
-./bin/test-mesh            # 10/10 unit tests
+gcc -Wall -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
+./bin/test-mesh              # 10/10 — proxy, actor, handler contract, TTL
+
+make test-concurrency        # ACTOR_CONCURRENCY and child reaping
+make test-isolation          # ACTOR_* confinement (Linux)
+```
+
+`test-isolation` skips cases the host cannot support — unprivileged namespaces,
+cgroup v2 delegation — rather than failing them. To exercise everything in the
+image actors actually run in:
+
+```sh
+podman build -f Dockerfile.test -t actor-test .
+podman run --rm actor-test sh -c 'cd /src && ./bin/test-isolation'
 ```
 
 ## Documents
@@ -94,6 +110,7 @@ gcc -Wall -O2 tests/test-mesh.c -lnng -o bin/test-mesh
 | [SPEC.md](SPEC.md) | Formal specification (Z-notation schemas, procedures, predicates) |
 | [AGENTS.md](AGENTS.md) | Multi-agent patterns, tool discovery, LLM integration |
 | [START.md](START.md) | Getting started, troubleshooting, MCP tool auto-discovery |
+| [DESIGN.md#isolation](DESIGN.md#isolation) | Optional process/tuple confinement — namespaces, Landlock, seccomp, cgroups |
 
 ## Lineage
 

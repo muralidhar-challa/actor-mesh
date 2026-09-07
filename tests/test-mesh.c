@@ -20,13 +20,25 @@ static void ms(int ms) { struct timespec t={ms/1000,(ms%1000)*1000000}; nanoslee
 #define CHECK(c,m) do { if(c)PASS(); else FAIL(m); } while(0)
 
 static void free_ports(void) { system("fuser -k 55656/tcp 55657/tcp 2>/dev/null"); ms(400); }
-static void cleanup(void) { system("pkill -9 mesh-proxy actor 2>/dev/null"); ms(300); }
+static void cleanup(void) {
+    system("pkill -9 -f 'bin/mesh-proxy' 2>/dev/null");
+    system("pkill -9 -f 'bin/actor' 2>/dev/null");
+    ms(300);
+}
 
 static pid_t sp(char **a, char **e) { pid_t p; posix_spawn(&p, a[0], NULL, NULL, a, e); return p; }
 
+/* Frame buffer is header + payload. It was f[261] -- 256 bytes of header and
+   room for only 5 payload bytes -- so any test sending more (t9's 52-byte
+   msgpack announce) wrote past the end of the stack buffer and smashed the
+   return address. Sized to the header plus a payload cap the tests stay well
+   under, and asserted rather than silently truncated. */
+#define TEST_MAX_PAYLOAD 1024
+
 static void sendm(const char *topic, const uint8_t *p, size_t pl) {
+    if (pl > TEST_MAX_PAYLOAD) { FAIL("sendm: payload exceeds TEST_MAX_PAYLOAD"); return; }
     nng_socket s; nng_pub0_open(&s); nng_dial(s, PP, NULL, 0); ms(50);
-    uint8_t f[261]={0}; int tl=strlen(topic); if(tl>31)tl=31;
+    uint8_t f[256+TEST_MAX_PAYLOAD]={0}; int tl=strlen(topic); if(tl>31)tl=31;
     memcpy(f, topic, tl); memcpy(f+80, "test", 4);
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns=ts.tv_sec*1000000000LL+ts.tv_nsec;
@@ -50,7 +62,7 @@ static ssize_t recvm(const char *topic, uint8_t *b, size_t cap, int to) {
 
 static void t1(void){ TEST("proxy: forward");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     /* Create subscriber FIRST, then send */
     nng_socket sub; nng_sub0_open(&sub); nng_dial(sub, SP, NULL, 0);
@@ -59,13 +71,14 @@ static void t1(void){ TEST("proxy: forward");
     ms(100);
     uint8_t p[]="hello"; sendm("t1",p,5);
     nng_msg *m=NULL; CHECK(nng_recvmsg(sub,&m,0)==0,"not forwarded");
-    if(m)nng_msg_free(m); nng_close(sub);
+    if(m)nng_msg_free(m);
+    nng_close(sub);
     kill(pp,SIGKILL); waitpid(pp,NULL,0);
 }
 
 static void t2(void){ TEST("proxy: topic filter");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     sendm("topic_A",(uint8_t*)"x",1);
     CHECK(recvm("topic_B",NULL,0,1000)<0,"wrong topic"); kill(pp,SIGKILL); waitpid(pp,NULL,0);
@@ -73,10 +86,10 @@ static void t2(void){ TEST("proxy: topic filter");
 
 static void t3(void){ TEST("actor: respond");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm3");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a3","ACTOR_TOPIC=ping","ACTOR_RESULT_TOPIC=pong",
         "ACTOR_HANDLER=sh -c 'echo pong; echo ok'","ACTOR_LMDB_PATH=/tmp/tm3",NULL};
@@ -88,10 +101,10 @@ static void t3(void){ TEST("actor: respond");
 
 static void t4(void){ TEST("actor: retry");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("rm -rf /tmp/tm4; mkdir -p /tmp/tm4");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_RETRY_MAX=3","ACTOR_ID=a4","ACTOR_TOPIC=ri","ACTOR_RESULT_TOPIC=ro",
         "ACTOR_HANDLER=sh -c 'A=/tmp/tm4/c; C=$(cat $A 2>/dev/null||echo 0); C=$((C+1)); echo $C > $A; [ $C -ge 2 ] && echo ro && echo ok || exit 1'",
@@ -104,10 +117,10 @@ static void t4(void){ TEST("actor: retry");
 
 static void t5(void){ TEST("actor: multi-topic");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm5");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a5","ACTOR_TOPIC=ta,tb","ACTOR_RESULT_TOPIC=out",
         "ACTOR_HANDLER=sh -c 'echo out; echo got'","ACTOR_LMDB_PATH=/tmp/tm5",NULL};
@@ -119,10 +132,10 @@ static void t5(void){ TEST("actor: multi-topic");
 
 static void t6(void){ TEST("actor: TTL expiry");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm6");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a6","ACTOR_TOPIC=ttl_in","ACTOR_RESULT_TOPIC=ttl_out",
         "ACTOR_HANDLER=sh -c 'echo ttl_out; echo bad'","ACTOR_LMDB_PATH=/tmp/tm6",
@@ -137,10 +150,10 @@ static void t6(void){ TEST("actor: TTL expiry");
 
 static void t7(void){ TEST("handler: env vars");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm7");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a7","ACTOR_TOPIC=ei","ACTOR_RESULT_TOPIC=eo",
         "ACTOR_HANDLER=sh -c 'echo eo; echo T=\\$ACTOR_TUPLE_ID C=\\$ACTOR_CORRELATION_ID O=\\$ACTOR_TUPLE_ORIGIN A=\\$ACTOR_ATTEMPT'",
@@ -156,10 +169,10 @@ static void t7(void){ TEST("handler: env vars");
 
 static void t8(void){ TEST("handler: topic route");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm8");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a8","ACTOR_TOPIC=di","ACTOR_RESULT_TOPIC=def",
         "ACTOR_HANDLER=sh -c 'echo custom; echo ok'","ACTOR_LMDB_PATH=/tmp/tm8",NULL};
@@ -171,15 +184,15 @@ static void t8(void){ TEST("handler: topic route");
 
 static void t9(void){ TEST("registry: store tool");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("rm -rf /tmp/tm9; mkdir -p /tmp/tm9");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a9","ACTOR_TOPIC=_tool_announce,_tool_discover","ACTOR_RESULT_TOPIC=_tool_list",
-        "ACTOR_HANDLER=../examples/employee-mesh/handlers/registry/tool-registry.sh",
+        "ACTOR_HANDLER=./examples/employee-mesh/handlers/registry/tool-registry.sh",
         "ACTOR_LMDB_PATH=/tmp/tm9",
-        "BRIDGE_LIB=/home/max/Projects/mesh-actors/../examples/employee-mesh/handlers/lib",NULL};
+        "BRIDGE_LIB=./examples/employee-mesh/handlers/lib",NULL};
     pid_t ap=sp(aa,ae); ms(600);
     uint8_t mp[]={0x83,0xa4,'t','y','p','e',0xae,'_','t','o','o','l','_','a','n','n','o','u','n','c','e',
         0xa5,'a','c','t','o','r',0xa2,'t','9',0xac,'c','a','p','a','b','i','l','i','t','i','e','s',
@@ -192,10 +205,10 @@ static void t9(void){ TEST("registry: store tool");
 
 static void t10(void){ TEST("heartbeat: actors emit");
     free_ports(); cleanup();
-    char *a[]={"bi../bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
     pid_t pp=sp(a,e); ms(600);
     system("mkdir -p /tmp/tm10");
-    char *aa[]={"bi../bin/actor",NULL},*ae[]={
+    char *aa[]={"./bin/actor",NULL},*ae[]={
         "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
         "ACTOR_HEARTBEAT_MS=500","ACTOR_ID=hb","ACTOR_TOPIC=none","ACTOR_RESULT_TOPIC=ignored",
         "ACTOR_HANDLER=sh -c 'echo ignored; echo ok'","ACTOR_LMDB_PATH=/tmp/tm10",NULL};
@@ -205,7 +218,12 @@ static void t10(void){ TEST("heartbeat: actors emit");
     nng_socket_set(s, NNG_OPT_SUB_SUBSCRIBE, "heartbeat", 9);
     nng_socket_set_ms(s, "recv-timeout", 2000);
     nng_msg *m=NULL; int got=0;
-    for(int i=0;i<3;i++){ if(nng_recvmsg(s,&m,0)==0){got++; if(m)nng_msg_free(m);} }
+    /* Reset m after every free: nng_recvmsg leaves it untouched on timeout,
+       so a stale pointer here means the next iteration frees it twice. */
+    for(int i=0;i<3;i++){
+        m=NULL;
+        if(nng_recvmsg(s,&m,0)==0){ got++; if(m){ nng_msg_free(m); m=NULL; } }
+    }
     nng_close(s);
     CHECK(got>0,"no heartbeat received");
     if(got>0) printf("  received %d heartbeat(s)\n", got);

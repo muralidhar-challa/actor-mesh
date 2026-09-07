@@ -16,3 +16,7 @@ bin/
 *.swp
 *.swo
 *~
+
+# Compiled handler helpers (built by examples/employee-mesh/Makefile)
+examples/employee-mesh/handlers/lib/mpack-get
+examples/employee-mesh/handlers/lib/mpack-pack
